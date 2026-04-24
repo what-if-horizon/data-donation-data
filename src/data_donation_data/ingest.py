@@ -1,0 +1,425 @@
+"""
+Donation data file ingestion.
+
+File naming convention
+----------------------
+Key=value pairs are separated by underscores that **immediately precede a
+known key name**, so values that contain underscores (e.g.
+``source=google_chrome``) are handled correctly::
+
+    assignment=359_task=862_participant=01a1f222ad90a288_source=YouTube_key=1763123719433.json
+
+Known keys: assignment, task, participant, source, key.
+
+Storage model
+-------------
+Data is stored in long format across three normalised tables:
+
+* ``fields``       — one row per unique (source, field) pair; auto-generates
+                     ``field_id``.
+* ``participants`` — one row per unique participant string; auto-generates
+                     ``participant_id``.
+* ``data``         — one row per observation: (field_id, participant_id,
+                     assignment, task, key, value).
+
+URL values (any value starting with ``http://`` or ``https://``) are also
+inserted into the ``urls`` table so the scraper can process them later.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from pathlib import Path
+from typing import Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Filename parsing
+# ---------------------------------------------------------------------------
+
+#: The fixed set of key names that appear in donation data filenames.
+DONATION_KEYS: tuple[str, ...] = ("assignment", "task", "participant", "source", "key")
+
+# Split on "_" that is immediately followed by one of the known key names and "=".
+# A lookahead is used so the "_" is consumed but the "key=" portion is kept.
+_SPLIT_RE: re.Pattern = re.compile(r"_(?=(?:" + "|".join(DONATION_KEYS) + r")=)")
+
+
+def parse_donation_filename(stem: str) -> dict[str, str]:
+    """
+    Parse a donation data filename stem into its key=value components.
+
+    The stem is split only at underscores that immediately precede a known
+    key name, so values containing underscores (e.g. ``source=google_chrome``)
+    are preserved intact.
+
+    Parameters
+    ----------
+    stem:
+        Filename without extension, e.g.
+        ``assignment=1_task=2_participant=abc_source=YouTube_key=999``.
+
+    Returns
+    -------
+    dict
+        Contains only the recognised keys found in *stem*.
+
+    Examples
+    --------
+    >>> parse_donation_filename(
+    ...     "assignment=359_task=862_participant=abc_source=google_chrome_key=99"
+    ... )
+    {'assignment': '359', 'task': '862', 'participant': 'abc',
+     'source': 'google_chrome', 'key': '99'}
+    """
+    parts = _SPLIT_RE.split(stem)
+    result: dict[str, str] = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k in DONATION_KEYS:
+                result[k] = v
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Value helpers
+# ---------------------------------------------------------------------------
+
+
+def _to_db_value(v: object) -> Optional[str]:
+    """Convert any JSON value to a TEXT-compatible DB string, or ``None``."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+
+def _is_url(value: str) -> bool:
+    """Return ``True`` if *value* looks like an HTTP(S) URL."""
+    return value.startswith(("http://", "https://"))
+
+
+# ---------------------------------------------------------------------------
+# URL normalisation
+# ---------------------------------------------------------------------------
+
+#: Query parameters that are always stripped — they carry tracking / analytics
+#: information and never affect the page content that will be scraped.
+_TRACKING_PARAMS: frozenset[str] = frozenset(
+    {
+        # Google Analytics / UTM
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "utm_id",
+        "utm_source_platform",
+        "utm_creative_format",
+        # Google Ads
+        "gclid",
+        "gclsrc",
+        "dclid",
+        # Facebook
+        "fbclid",
+        "fb_action_ids",
+        "fb_action_types",
+        "fb_source",
+        "fb_ref",
+        # Microsoft / Bing
+        "msclkid",
+        # Twitter / X
+        "twclid",
+        # Mailchimp
+        "mc_cid",
+        "mc_eid",
+        # Miscellaneous
+        "_ga",
+        "_gl",
+        "igshid",
+        "si",
+    }
+)
+
+#: For domains listed here, retain ONLY these query parameters.
+#: For every other domain ALL query parameters are dropped.
+#: This is intentionally aggressive: the trade-off is fewer unique URLs to
+#: scrape at the cost of losing parameter-dependent content on unknown sites.
+_KEEP_PARAMS: dict[str, frozenset[str]] = {
+    "youtube.com": frozenset({"v", "list"}),  # video ID + playlist ID
+    "youtu.be": frozenset(),  # video ID is in the path
+}
+
+
+def _base_domain(hostname: str) -> str:
+    """Strip a leading ``www.`` prefix for domain-whitelist lookups."""
+    return hostname.removeprefix("www.")
+
+
+def normalize_url(url: str) -> str | None:
+    """
+    Return a normalised form of *url*, or ``None`` if the URL is unusable.
+
+    Normalisation steps applied in order:
+
+    1. Lowercase scheme and hostname.
+    2. Remove default ports (80 for http, 443 for https).
+    3. Strip the URL fragment (``#...``).
+    4. For domains in ``_KEEP_PARAMS``, retain only the whitelisted query
+       parameters (e.g. ``v=`` on youtube.com); all others are dropped.
+    5. For every other domain, drop **all** query parameters.  This is
+       intentional — most page content is path-based, and stripping
+       parameters produces more duplicates, meaning fewer actual HTTP
+       requests and less exposure of tracking data.
+    6. Sort any retained parameters for a stable canonical form.
+
+    Parameters
+    ----------
+    url:
+        Raw URL string as extracted from donated data.
+
+    Returns
+    -------
+    str or None
+        Normalised URL string, or ``None`` if *url* is not a valid
+        ``http``/``https`` URL.
+
+    Examples
+    --------
+    >>> normalize_url("https://www.YouTube.com/watch?v=abc&utm_source=twitter#comments")
+    'https://www.youtube.com/watch?v=abc'
+    >>> normalize_url("https://example.com/article?ref=newsletter&id=42")
+    'https://example.com/article'
+    """
+    try:
+        parsed = urlparse(url.strip())
+    except Exception:
+        return None
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None
+
+    # Drop default ports.
+    port = parsed.port
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    netloc = f"{hostname}:{port}" if port else hostname
+
+    # Filter query parameters.
+    base = _base_domain(hostname)
+    keep = _KEEP_PARAMS.get(base)  # None → domain not in whitelist
+    if parsed.query and keep is not None:
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        filtered = sorted((k, v[0]) for k, v in params.items() if k in keep)
+        query = urlencode(filtered) if filtered else ""
+    else:
+        # Domain not whitelisted → drop everything.
+        query = ""
+
+    return urlunparse((scheme, netloc, parsed.path or "/", "", query, ""))
+
+
+# ---------------------------------------------------------------------------
+# Lookup-or-create helpers (with in-memory caches)
+# ---------------------------------------------------------------------------
+
+
+def _get_or_create_participant(
+    con: sqlite3.Connection,
+    cache: dict[str, int],
+    participant: str,
+) -> int:
+    """Return ``participant_id`` for *participant*, inserting a new row if needed."""
+    if participant not in cache:
+        con.execute(
+            "INSERT OR IGNORE INTO participants (participant) VALUES (?)",
+            (participant,),
+        )
+        row = con.execute(
+            "SELECT participant_id FROM participants WHERE participant = ?",
+            (participant,),
+        ).fetchone()
+        cache[participant] = row["participant_id"]
+    return cache[participant]
+
+
+def _get_or_create_field(
+    con: sqlite3.Connection,
+    cache: dict[tuple[str, str], int],
+    source: str,
+    field: str,
+) -> int:
+    """Return ``field_id`` for *(source, field)*, inserting a new row if needed."""
+    key = (source, field)
+    if key not in cache:
+        con.execute(
+            "INSERT OR IGNORE INTO fields (source, field) VALUES (?, ?)",
+            (source, field),
+        )
+        row = con.execute(
+            "SELECT field_id FROM fields WHERE source = ? AND field = ?",
+            (source, field),
+        ).fetchone()
+        cache[key] = row["field_id"]
+    return cache[key]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def ingest_donation_directory(
+    con: sqlite3.Connection,
+    directory: Path,
+    *,
+    recursive: bool = False,
+    batch_size: int = 500,
+) -> dict[str, int]:
+    """
+    Scan *directory* for donation data JSON files and ingest them.
+
+    Each ``.json`` file must follow the donation naming convention.  Files
+    that cannot be parsed, lack a ``source`` or ``participant`` in their
+    name, or contain non-dict / non-list JSON are silently skipped.
+
+    URL values (starting with ``http://`` or ``https://``) are automatically
+    inserted into the ``urls`` table with ``status='pending'`` so the
+    scraper can process them without a separate queueing step.
+
+    Parameters
+    ----------
+    con:
+        Open :class:`sqlite3.Connection` (core tables must already exist).
+    directory:
+        Path to the directory to scan.
+    recursive:
+        When ``True``, scan sub-directories recursively (``**/*.json``).
+    batch_size:
+        Number of data rows accumulated before each ``executemany`` flush.
+
+    Returns
+    -------
+    dict
+        ``{"files": n, "rows": n, "urls": n, "skipped": n}``.
+    """
+    if not directory.is_dir():
+        raise ValueError(f"{directory} is not a directory")
+
+    glob_pat = "**/*.json" if recursive else "*.json"
+    files = sorted(directory.glob(glob_pat))
+
+    if not files:
+        return {"files": 0, "rows": 0, "urls": 0, "skipped": 0}
+
+    # In-memory caches to avoid redundant round-trips for the same
+    # participant / field within a single ingest run.
+    participant_cache: dict[str, int] = {}
+    field_cache: dict[tuple[str, str], int] = {}
+
+    # Accumulators for batched inserts.
+    data_batch: list[tuple] = []
+    url_batch: list[tuple] = []
+
+    total_files = 0
+    total_rows = 0
+    total_urls = 0
+    skipped = 0
+
+    def _flush() -> None:
+        nonlocal total_rows, total_urls
+        if data_batch:
+            con.executemany(
+                "INSERT INTO data (field_id, participant_id, assignment, task, key, value) VALUES (?, ?, ?, ?, ?, ?)",
+                data_batch,
+            )
+            total_rows += len(data_batch)
+            data_batch.clear()
+        if url_batch:
+            con.executemany(
+                "INSERT INTO urls (participant_id, field_id, url, normalized_url) VALUES (?, ?, ?, ?)",
+                url_batch,
+            )
+            total_urls += len(url_batch)
+            url_batch.clear()
+
+    for path in tqdm(files, desc="Ingesting", unit=" files"):
+        meta = parse_donation_filename(path.stem)
+
+        if "source" not in meta or "participant" not in meta:
+            skipped += 1
+            continue
+
+        source = meta["source"].lower()
+
+        try:
+            with path.open(encoding="utf-8") as fh:
+                content = json.load(fh)
+        except Exception:  # noqa: BLE001
+            skipped += 1
+            continue
+
+        # Normalise to a list of dicts; anything else is unsupported.
+        if isinstance(content, dict):
+            records: list[dict] = [content]
+        elif isinstance(content, list):
+            records = [r for r in content if isinstance(r, dict)]
+        else:
+            skipped += 1
+            continue
+
+        if not records:
+            skipped += 1
+            continue
+
+        participant_id = _get_or_create_participant(con, participant_cache, meta["participant"])
+
+        for record in records:
+            for field_name, raw_value in record.items():
+                field_id = _get_or_create_field(con, field_cache, source, field_name)
+                value = _to_db_value(raw_value)
+
+                data_batch.append(
+                    (
+                        field_id,
+                        participant_id,
+                        meta.get("assignment"),
+                        meta.get("task"),
+                        meta.get("key"),
+                        value,
+                    )
+                )
+
+                # Auto-queue URL values for scraping.
+                if value and _is_url(value):
+                    normalized = normalize_url(value)
+                    if normalized:
+                        url_batch.append((participant_id, field_id, value, normalized))
+
+        total_files += 1
+
+        if len(data_batch) >= batch_size:
+            _flush()
+
+    _flush()
+    con.commit()
+
+    return {
+        "files": total_files,
+        "rows": total_rows,
+        "urls": total_urls,
+        "skipped": skipped,
+    }
