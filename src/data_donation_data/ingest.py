@@ -91,11 +91,22 @@ def parse_donation_filename(stem: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+#: String sentinels that various sources write instead of a proper JSON null.
+_NULL_SENTINELS: frozenset[str] = frozenset({"null", "None"})
+
+
 def _to_db_value(v: object) -> Optional[str]:
-    """Convert any JSON value to a TEXT-compatible DB string, or ``None``."""
+    """Convert any JSON value to a TEXT-compatible DB string, or ``None``.
+
+    String sentinels such as ``"null"`` (common in TikTok and YouTube exports)
+    and ``"None"`` (Python's ``None`` serialised as a string) are mapped to
+    ``None`` so they are stored as SQL NULL rather than the literal text.
+    """
     if v is None:
         return None
     if isinstance(v, str):
+        if v in _NULL_SENTINELS:
+            return None
         return v
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False)
@@ -292,9 +303,13 @@ def ingest_donation_directory(
     """
     Scan *directory* for donation data JSON files and ingest them.
 
-    Each ``.json`` file must follow the donation naming convention.  Files
-    that cannot be parsed, lack a ``source`` or ``participant`` in their
-    name, or contain non-dict / non-list JSON are silently skipped.
+    Each ``.json`` file must follow the donation naming convention.  The
+    JSON content must be an array of *table objects*: each table object
+    contains one key whose value is a list of row dicts (the table data)
+    plus optional scalar metadata fields (e.g. ``"deleted row count"``) that
+    are ignored.  Field names are stored as ``"TableName.column_name"``.
+    Files that cannot be parsed or lack a ``source`` or ``participant`` in
+    their name are silently skipped.
 
     URL values (starting with ``http://`` or ``https://``) are automatically
     inserted into the ``urls`` table with ``status='pending'`` so the
@@ -314,7 +329,7 @@ def ingest_donation_directory(
     Returns
     -------
     dict
-        ``{"files": n, "rows": n, "urls": n, "skipped": n}``.
+        ``{"files": n, "rows": n, "urls": n, "skipped": n, "already_ingested": n}``.
     """
     if not directory.is_dir():
         raise ValueError(f"{directory} is not a directory")
@@ -338,6 +353,7 @@ def ingest_donation_directory(
     total_rows = 0
     total_urls = 0
     skipped = 0
+    already_ingested = 0
 
     def _flush() -> None:
         nonlocal total_rows, total_urls
@@ -363,6 +379,11 @@ def ingest_donation_directory(
             skipped += 1
             continue
 
+        # Skip files that have already been ingested.
+        if con.execute("SELECT 1 FROM ingested_files WHERE file_stem = ?", (path.stem,)).fetchone():
+            already_ingested += 1
+            continue
+
         source = meta["source"].lower()
 
         try:
@@ -372,44 +393,55 @@ def ingest_donation_directory(
             skipped += 1
             continue
 
-        # Normalise to a list of dicts; anything else is unsupported.
-        if isinstance(content, dict):
-            records: list[dict] = [content]
-        elif isinstance(content, list):
-            records = [r for r in content if isinstance(r, dict)]
-        else:
+        # Each file is a JSON array of table objects.
+        # Each table object has one key whose value is a list (the table rows)
+        # plus optional metadata keys with scalar values (e.g. "deleted row count").
+        if not isinstance(content, list):
             skipped += 1
             continue
 
-        if not records:
+        table_objects = [item for item in content if isinstance(item, dict)]
+        if not table_objects:
             skipped += 1
             continue
 
         participant_id = _get_or_create_participant(con, participant_cache, meta["participant"])
 
-        for record in records:
-            for field_name, raw_value in record.items():
-                field_id = _get_or_create_field(con, field_cache, source, field_name)
-                value = _to_db_value(raw_value)
+        for table_obj in table_objects:
+            for table_name, table_rows in table_obj.items():
+                # Skip metadata fields — only the key whose value is a list
+                # of dicts represents actual table data.
+                if not isinstance(table_rows, list):
+                    continue
 
-                data_batch.append(
-                    (
-                        field_id,
-                        participant_id,
-                        meta.get("assignment"),
-                        meta.get("task"),
-                        meta.get("key"),
-                        value,
-                    )
-                )
+                for row in table_rows:
+                    if not isinstance(row, dict):
+                        continue
 
-                # Auto-queue URL values for scraping.
-                if value and _is_url(value):
-                    normalized = normalize_url(value)
-                    if normalized:
-                        url_batch.append((participant_id, field_id, value, normalized))
+                    for col_name, raw_value in row.items():
+                        field_name = f"{table_name}.{col_name}"
+                        field_id = _get_or_create_field(con, field_cache, source, field_name)
+                        value = _to_db_value(raw_value)
+
+                        data_batch.append(
+                            (
+                                field_id,
+                                participant_id,
+                                meta.get("assignment"),
+                                meta.get("task"),
+                                meta.get("key"),
+                                value,
+                            )
+                        )
+
+                        # Auto-queue URL values for scraping.
+                        if value and _is_url(value):
+                            normalized = normalize_url(value)
+                            if normalized:
+                                url_batch.append((participant_id, field_id, value, normalized))
 
         total_files += 1
+        con.execute("INSERT OR IGNORE INTO ingested_files (file_stem) VALUES (?)", (path.stem,))
 
         if len(data_batch) >= batch_size:
             _flush()
@@ -422,4 +454,5 @@ def ingest_donation_directory(
         "rows": total_rows,
         "urls": total_urls,
         "skipped": skipped,
+        "already_ingested": already_ingested,
     }

@@ -9,3 +9,5 @@ build/
 *.db-wal
 .env
 *.log
+
+data/*

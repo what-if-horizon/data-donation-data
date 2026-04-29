@@ -36,8 +36,8 @@ from data_donation_data.summarise import (
     list_sources,
     list_tables,
     participant_field_summary,
+    summarise_all_sources,
     summarise_source,
-    summarise_table,
 )
 
 console = Console()
@@ -132,12 +132,14 @@ def cmd_ingest(directory: Path, recursive: bool) -> None:
 
     skipped_note = f" ([dim]{counts['skipped']} file(s) skipped[/dim])" if counts["skipped"] else ""
     url_note = f", [bold]{counts['urls']:,}[/bold] URL(s) queued" if counts["urls"] else ""
+    already_note = f" ([dim]{counts['already_ingested']:,} already ingested[/dim])" if counts["already_ingested"] else ""
     console.print(
         f"[green]✓[/green] Ingested "
         f"[bold]{counts['files']}[/bold] file(s) / "
         f"[bold]{counts['rows']:,}[/bold] row(s)"
         f"{url_note}"
         f"{skipped_note}"
+        f"{already_note}"
     )
 
 
@@ -147,38 +149,34 @@ def cmd_ingest(directory: Path, recursive: bool) -> None:
 
 
 @cli.command("summarise")
-@click.argument("table")
-def cmd_summarise(table: str) -> None:
-    """Print a column-level summary of TABLE.
+def cmd_summarise() -> None:
+    """Print a source-level summary across all ingested sources.
 
-    TABLE is a raw SQLite table name (e.g. data, fields, participants,
-    urls, url_metadata).  For a field-level summary of a donation source
-    use `ddd summarise-source`.
+    For a field-level breakdown of a specific source use `ddd summarise-source`.
     """
     with get_connection() as con:
-        try:
-            summary = summarise_table(con, table)
-        except ValueError as exc:
-            raise click.ClickException(str(exc)) from exc
+        rows = summarise_all_sources(con)
 
-    console.print(f"\n[bold]Table:[/bold] [cyan]{summary.table}[/cyan]  [bold]Rows:[/bold] {summary.row_count:,}\n")
+    if not rows:
+        console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
+        return
 
-    t = RichTable(show_lines=True)
-    t.add_column("Column", style="cyan", no_wrap=True)
+    t = RichTable(title="Source summary", show_lines=True)
+    t.add_column("Source", style="cyan", no_wrap=True)
+    t.add_column("Fields", justify="right")
+    t.add_column("Participants", justify="right")
+    t.add_column("Observations", justify="right")
     t.add_column("Non-null", justify="right")
-    t.add_column("Null", justify="right")
-    t.add_column("Null %", justify="right")
-    t.add_column("Distinct", justify="right")
-    t.add_column("Samples", style="dim")
+    t.add_column("Non-null %", justify="right")
 
-    for col in summary.columns:
+    for row in rows:
         t.add_row(
-            col.name,
-            f"{col.non_null:,}",
-            f"{col.null_count:,}",
-            f"{col.null_pct:.1f}%",
-            f"{col.distinct:,}",
-            " | ".join(col.samples[:3]),
+            row["source"],
+            f"{row['n_fields']:,}",
+            f"{row['n_participants']:,}",
+            f"{row['n_total']:,}",
+            f"{row['n_non_null']:,}",
+            f"{row['pct_non_null']:.1f}%",
         )
 
     console.print(t)
@@ -394,13 +392,6 @@ def scrape_group() -> None:
     help="Minimum seconds between requests to the same domain.",
 )
 @click.option(
-    "--delay-max",
-    default=2.5,
-    show_default=True,
-    type=float,
-    help="Maximum seconds between requests to the same domain.",
-)
-@click.option(
     "--concurrency",
     "-j",
     default=10,
@@ -411,7 +402,6 @@ def scrape_group() -> None:
 def cmd_scrape_run(
     limit: int | None,
     delay_min: float,
-    delay_max: float,
     concurrency: int,
 ) -> None:
     """Scrape all pending URLs concurrently.
@@ -422,7 +412,8 @@ def cmd_scrape_run(
     Requests to different domains run in parallel (up to --concurrency).
     Requests to the same domain are serialised with a per-domain random delay.
     """
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+    from rich.progress import MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+    from rich.table import Column
 
     with get_connection() as con:
         pending_count: int = con.execute("SELECT COUNT(DISTINCT url) FROM urls WHERE status = 'pending'").fetchone()[0]
@@ -436,28 +427,37 @@ def cmd_scrape_run(
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
         MofNCompleteColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TextColumn(
+            "{task.fields[url]}",
+            table_column=Column(no_wrap=False, overflow="crop", ratio=1),
+        ),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Scraping…", total=effective_total)
+        task = progress.add_task(f"[red]{0:5.1f}% failed[/red]", total=effective_total, url="")
+
+        _counts = {"failed": 0}
 
         def _on_progress(url: str, status: str, idx: int, total: int) -> None:
-            colour = "green" if status == "success" else "red"
-            short_url = url[:60] + "…" if len(url) > 60 else url
+            if status != "success":
+                _counts["failed"] += 1
+
+            pct = _counts["failed"] / idx * 100 if idx else 0.0
+            textcol = "red" if status != "success" else "green"
+
             progress.update(
                 task,
                 advance=1,
-                description=f"[{colour}]{status}[/{colour}] {short_url}",
+                description=f"[red]{pct:5.1f}% failed[/red]",
+                url=f"[{textcol}]{url}[/{textcol}]",
             )
 
         with get_connection() as con:
             counts = scrape_pending(
                 con,
                 delay_min=delay_min,
-                delay_max=delay_max,
                 concurrency=concurrency,
                 limit=limit,
                 on_progress=_on_progress,

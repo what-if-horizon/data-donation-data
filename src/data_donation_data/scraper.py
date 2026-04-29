@@ -64,7 +64,6 @@ USER_AGENT = "Twitterbot/1.0 (compatible; academic-research-metadata-scraper)"
 
 DEFAULT_TIMEOUT = 15  # seconds per request
 DEFAULT_DELAY_MIN = 0.5  # min seconds between requests to the *same* domain
-DEFAULT_DELAY_MAX = 2.5  # max seconds between requests to the *same* domain
 DEFAULT_CONCURRENCY = 10  # max simultaneous in-flight requests
 MAX_RETRIES = 2  # transient-error retries per URL
 
@@ -122,7 +121,6 @@ async def _scrape_one(
     domain_locks: defaultdict,
     domain_last_request: dict[str, float],
     delay_min: float,
-    delay_max: float,
 ) -> tuple[str, str, dict]:
     """
     Fetch and extract metadata for a single URL.
@@ -148,9 +146,8 @@ async def _scrape_one(
         last_time = domain_last_request.get(domain)
         if last_time is not None:
             elapsed = time.monotonic() - last_time
-            delay = random.uniform(delay_min, delay_max)
-            if elapsed < delay:
-                await asyncio.sleep(delay - elapsed)
+            if elapsed < delay_min:
+                await asyncio.sleep(delay_min - elapsed)
 
         async with semaphore:
             try:
@@ -203,7 +200,6 @@ async def _run_scrape(
     pending_urls: list[str],
     *,
     delay_min: float,
-    delay_max: float,
     concurrency: int,
     on_progress: Optional[Callable],
 ) -> dict[str, int]:
@@ -237,7 +233,6 @@ async def _run_scrape(
                 domain_locks=domain_locks,
                 domain_last_request=domain_last_request,
                 delay_min=delay_min,
-                delay_max=delay_max,
             )
             # DB write — safe on the single asyncio thread.
             _update_after_scrape(con, normalized_url, status=status, **kwargs)
@@ -260,7 +255,6 @@ def scrape_pending(
     con: sqlite3.Connection,
     *,
     delay_min: float = DEFAULT_DELAY_MIN,
-    delay_max: float = DEFAULT_DELAY_MAX,
     concurrency: int = DEFAULT_CONCURRENCY,
     limit: Optional[int] = None,
     on_progress: Optional[Callable] = None,
@@ -277,8 +271,8 @@ def scrape_pending(
     ``status='failed'``.
 
     Requests to different domains run **concurrently** (up to *concurrency*
-    simultaneous connections).  Requests to the **same domain** are
-    serialised with a random delay of ``[delay_min, delay_max]`` seconds.
+    simultaneous connections).  Requests to the **same domain** respect the
+    delay_min setting.
 
     The pending list is shuffled before dispatch to spread domains across
     worker slots from the start.
@@ -287,8 +281,8 @@ def scrape_pending(
     ----------
     con:
         Open database connection.
-    delay_min / delay_max:
-        Random delay range applied **only** between consecutive requests to
+    delay_min:
+        delay minimum applied **only** between consecutive requests to
         the *same* domain.
     concurrency:
         Maximum number of simultaneous in-flight HTTP requests.
@@ -323,7 +317,6 @@ def scrape_pending(
             con,
             pending_urls,
             delay_min=delay_min,
-            delay_max=delay_max,
             concurrency=concurrency,
             on_progress=on_progress,
         )

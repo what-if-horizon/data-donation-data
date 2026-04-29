@@ -1,7 +1,3 @@
-# STATUS
-
-This is just a quick first Claude build. The goal is to have a simple python module to manage the What If Data Donation data CLI scripts.
-
 # data-donation-data
 
 A Python package for ingesting, querying, and web-scraping donated dataset files.
@@ -9,15 +5,17 @@ Data is stored in a local SQLite database and managed through the `ddd` command-
 
 ## Features
 
-- **Ingest**: Scan a directory of donation data JSON files and load them into
-  source-specific SQLite tables, parsing structured metadata from the filenames.
-- **Summarise**: Inspect any table column-by-column, or export a long-format
-  participant × field coverage report across all donation tables.
+- **Ingest**: Scan a directory of donation data JSON files and load them into a
+  normalised long-format database, parsing structured metadata from the filenames.
+  URL values are automatically queued for scraping.
+- **Summarise**: Inspect any table column-by-column, or explore a donation source
+  field-by-field. Export a long-format participant × field coverage report.
 - **Extract**: Export a selection of columns from any table to CSV or JSONL.
-- **Scrape**: Queue URLs from any table column and scrape structured metadata
-  (Open Graph, JSON-LD, microdata, Dublin Core, RDFa, microformat) into a
-  dedicated `url_metadata` table, with parallel cross-domain requests and
-  polite per-domain rate limiting.
+- **Export**: Generate a `ddd_export.yaml` config file to toggle which fields
+  to include in exports.
+- **Scrape**: Scrape structured metadata (Open Graph, JSON-LD, microdata,
+  Dublin Core, RDFa, microformat) from all queued URLs, with parallel
+  cross-domain requests and polite per-domain rate limiting.
 
 ## Installation
 
@@ -38,6 +36,20 @@ export DDD_DB=/path/to/my.db
 
 ---
 
+## Database schema
+
+Data is stored in a normalised long-format schema across five tables:
+
+| Table | Description |
+|---|---|
+| `fields` | One row per unique `(source, field)` pair; auto-generates `field_id` |
+| `participants` | One row per unique participant string; auto-generates `participant_id` |
+| `data` | One row per observation: `(field_id, participant_id, assignment, task, key, value)` |
+| `urls` | One row per `(participant, field, url)` triple found during ingest; tracks scraping status |
+| `url_metadata` | One row per canonical URL, populated by the scraper |
+
+---
+
 ## Commands
 
 ### `ddd ingest <directory>`
@@ -54,11 +66,13 @@ The filename is split on `_<key>=` boundaries (not plain underscores), so
 source names that contain underscores (e.g. `source=google_chrome`) are handled
 correctly.
 
-Each source gets its own table named `ddd_<source>` (e.g. `ddd_youtube`,
-`ddd_google_chrome`). Every table has columns for the four metadata fields
-(`assignment`, `task`, `participant`, `key`) followed by one column per JSON
-field found in the file bodies. New columns are added automatically as new
-fields are encountered across files.
+Data is stored in long format across the `fields`, `participants`, and `data`
+tables. Any field value that starts with `http://` or `https://` is automatically
+added to the `urls` table with `status='pending'` for later scraping — no
+separate queue step is needed.
+
+Files that do not match the naming convention are silently skipped and
+reported in the summary.
 
 ```sh
 # Ingest all JSON files in a directory
@@ -67,9 +81,6 @@ ddd ingest path/to/data/
 # Also scan sub-directories
 ddd ingest path/to/data/ --recursive
 ```
-
-Files that do not match the naming convention (e.g. missing a `source=` part)
-are silently skipped and reported in the summary.
 
 ---
 
@@ -83,22 +94,59 @@ ddd tables
 
 ---
 
-### `ddd summarise <table>`
+### `ddd sources`
 
-Print a column-level summary of any table: row count, non-null count, null
-percentage, distinct value count, and a few sample values.
+List all data sources that have been ingested (distinct values from the `source`
+column of the `fields` table).
 
 ```sh
-ddd summarise ddd_youtube
+ddd sources
+```
+
+---
+
+### `ddd summarise`
+
+Print a source-level summary across all ingested sources, showing the number of
+fields, participants, total observations, and non-null percentage per source.
+For a field-level breakdown of a specific source use `ddd summarise-source`.
+
+```sh
+ddd summarise
+```
+
+Output columns:
+
+| Column | Description |
+|---|---|
+| `Source` | Data source name |
+| `Fields` | Number of distinct fields for this source |
+| `Participants` | Number of distinct participants with data for this source |
+| `Observations` | Total observations across all participants and fields |
+| `Non-null` | Observations with a non-null value |
+| `Non-null %` | Percentage of non-null observations |
+
+---
+
+### `ddd summarise-source <source>`
+
+Print a field-level summary for a specific donation source: total observations,
+non-null count, non-null percentage, and number of distinct participants per field.
+
+`<source>` is a source name as shown by `ddd sources` (e.g. `youtube`,
+`google_chrome`).
+
+```sh
+ddd summarise-source youtube
 ```
 
 ---
 
 ### `ddd field-summary`
 
-Export a long-format CSV covering all `ddd_*` donation tables. For every
-combination of source × participant × field it reports the total number of
-rows for that participant and the number of non-missing values for that field.
+Export a long-format CSV covering all ingested sources. For every combination of
+source × participant × field it reports the total number of rows and the number
+of non-missing values.
 
 ```sh
 # Print to stdout
@@ -112,13 +160,11 @@ Output columns:
 
 | Column | Description |
 |---|---|
-| `source` | Data source (table name without the `ddd_` prefix) |
+| `source` | Data source name |
 | `participant` | Participant identifier |
-| `field` | Column / field name |
+| `field` | Field name |
 | `n_non_null` | Number of non-missing values for this participant + field |
 | `n_total` | Total rows for this participant in this source |
-
-Metadata columns (`assignment`, `task`, `key`) are excluded from the field list.
 
 ---
 
@@ -128,36 +174,42 @@ Export selected columns from any table to CSV or JSONL.
 
 ```sh
 # CSV to stdout
-ddd extract ddd_youtube participant url title
+ddd extract data participant_id value
 
 # JSONL to a file
-ddd extract ddd_youtube participant url --format jsonl --output urls.jsonl
+ddd extract data participant_id value --format jsonl --output out.jsonl
 
 # With a WHERE filter
-ddd extract ddd_youtube participant url --where "participant = 'alice'"
+ddd extract data value --where "field_id = 42"
 ```
 
 ---
 
-### `ddd scrape queue <table> <url_column>`
+### `ddd export init`
 
-Read unique URLs from a column in any table and add them to the `url_metadata`
-table as `pending`. Already-queued URLs are skipped by default.
+Create or update a `ddd_export.yaml` file listing every `(source, field)`
+combination with a boolean toggle. Re-run after ingesting more data to pick
+up any new fields without losing existing toggle settings.
 
 ```sh
-ddd scrape queue ddd_youtube url
+ddd export init
 
-# Re-queue URLs even if already present
-ddd scrape queue ddd_youtube url --allow-duplicates
+# Write to a custom path
+ddd export init --output my_export.yaml
 ```
+
+Edit the generated YAML manually to set fields to `true` (include) or
+`false` (exclude).
 
 ---
 
 ### `ddd scrape run`
 
-Scrape all pending URLs. Requests to **different domains run in parallel**;
-requests to the **same domain are serialised** with a random delay between
-them to avoid IP bans.
+Scrape all pending URLs. URLs are queued automatically during `ddd ingest` —
+any field value starting with `http://` or `https://` is added to the `urls`
+table. Requests to **different domains run in parallel**; requests to the
+**same domain are serialised** with a random delay between them to avoid
+IP bans.
 
 ```sh
 ddd scrape run
@@ -182,7 +234,8 @@ microformat) is stored as a JSON string in the `data` column of `url_metadata`.
 
 ### `ddd scrape status`
 
-Show a breakdown of `pending` / `success` / `failed` counts in `url_metadata`.
+Show a breakdown of `pending` / `success` / `failed` counts in the `urls`
+table, with both raw URL counts and deduplicated normalised URL counts.
 
 ```sh
 ddd scrape status
@@ -190,16 +243,27 @@ ddd scrape status
 
 ---
 
+## The `urls` table
+
+| Column | Type | Description |
+|---|---|---|
+| `url_id` | INTEGER | Primary key |
+| `participant_id` | INTEGER | FK → `participants` |
+| `field_id` | INTEGER | FK → `fields` |
+| `url` | TEXT | Raw URL as found in the donated data |
+| `normalized_url` | TEXT | Cleaned URL (tracking params stripped, used for deduplication) |
+| `canonical_url` | TEXT | Canonical URL resolved during scraping |
+| `status` | TEXT | `pending`, `success`, or `failed` |
+| `error` | TEXT | Error message if status is `failed` |
+
 ## The `url_metadata` table
 
 | Column | Type | Description |
 |---|---|---|
-| `url` | TEXT | Original queued URL (unique) |
-| `canonical_url` | TEXT | Canonical URL found on the page |
-| `status` | TEXT | `pending`, `success`, or `failed` |
+| `canonical_url` | TEXT | Canonical URL (primary key) |
 | `scraped_at` | TEXT | ISO-8601 timestamp of the scrape attempt |
 | `data` | TEXT | JSON string of all extracted structured metadata |
-| `error` | TEXT | Error message if status is `failed` |
+| `error` | TEXT | Error message if scraping failed |
 
 ---
 
@@ -208,10 +272,11 @@ ddd scrape status
 ```
 src/data_donation_data/
 ├── __init__.py      — package version
-├── db.py            — SQLite connection helper (WAL mode, DDD_DB env var)
+├── db.py            — SQLite connection helper + schema (WAL mode, DDD_DB env var)
 ├── ingest.py        — filename parsing + donation directory ingestion
 ├── summarise.py     — column summaries + participant × field report
 ├── extract.py       — CSV / JSONL export
+├── export.py        — ddd_export.yaml config management
 ├── scraper.py       — async URL scraper (httpx + extruct)
 └── cli.py           — Click-based `ddd` entry point
 ```

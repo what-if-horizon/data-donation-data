@@ -3,11 +3,12 @@ Summary helpers for the donation data schema.
 
 Public API
 ----------
-list_tables(con)            → list[str]   — all SQLite tables
-list_sources(con)           → list[str]   — distinct sources in the fields table
-summarise_table(con, table) → TableSummary — raw per-column stats for any table
-summarise_source(con, src)  → list[dict]  — per-field stats for a donation source
-participant_field_summary(con) → list[dict] — long-format source×participant×field counts
+list_tables(con)               → list[str]      — all SQLite tables
+list_sources(con)              → list[str]      — distinct sources in the fields table
+summarise_all_sources(con)     → list[dict]     — source-level rollup stats
+summarise_table(con, table)    → TableSummary   — raw per-column stats for any table
+summarise_source(con, src)     → list[dict]     — per-field stats for a donation source
+participant_field_summary(con) → list[dict]     — long-format source×participant×field counts
 """
 
 from __future__ import annotations
@@ -85,6 +86,37 @@ def summarise_table(con: sqlite3.Connection, table: str) -> TableSummary:
 # ---------------------------------------------------------------------------
 # Donation-data helpers
 # ---------------------------------------------------------------------------
+
+
+def summarise_all_sources(con: sqlite3.Connection) -> list[dict]:
+    """
+    Return source-level statistics across all donation sources.
+
+    Each dict contains:
+
+    * ``source``         — source name
+    * ``n_fields``       — number of distinct fields for this source
+    * ``n_participants`` — number of distinct participants with data for this source
+    * ``n_total``        — total observations across all participants and fields
+    * ``n_non_null``     — observations with a non-NULL value
+    * ``pct_non_null``   — percentage non-null (rounded to 1 dp)
+    """
+    rows = con.execute(
+        """
+        SELECT
+            f.source,
+            COUNT(DISTINCT f.field_id)                   AS n_fields,
+            COUNT(DISTINCT d.participant_id)              AS n_participants,
+            COUNT(*)                                      AS n_total,
+            COUNT(d.value)                               AS n_non_null,
+            ROUND(100.0 * COUNT(d.value) / COUNT(*), 1)  AS pct_non_null
+        FROM fields f
+        JOIN data d ON d.field_id = f.field_id
+        GROUP BY f.source
+        ORDER BY f.source
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_sources(con: sqlite3.Connection) -> list[str]:

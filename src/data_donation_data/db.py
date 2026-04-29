@@ -69,6 +69,10 @@ def ensure_core_tables(con: sqlite3.Connection) -> None:
         Long-format observation store: one row per (field, participant)
         value. Also records file-level provenance (assignment, task, key).
 
+    ingested_files
+        One row per successfully ingested file, keyed on the filename stem.
+        Used to skip already-processed files on subsequent ingest runs.
+
     urls
         One row per (participant, field, url) triple found during ingest.
         ``url`` is the raw value as found in the data; ``normalized_url``
@@ -129,6 +133,11 @@ def ensure_core_tables(con: sqlite3.Connection) -> None:
             ON urls(normalized_url);
         CREATE INDEX IF NOT EXISTS idx_urls_status
             ON urls(status);
+
+        CREATE TABLE IF NOT EXISTS ingested_files (
+            file_stem   TEXT PRIMARY KEY,
+            ingested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
 
         CREATE TABLE IF NOT EXISTS url_metadata (
             canonical_url TEXT PRIMARY KEY,
