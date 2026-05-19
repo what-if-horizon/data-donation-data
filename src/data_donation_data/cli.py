@@ -389,7 +389,13 @@ def scrape_group() -> None:
     default=0.5,
     show_default=True,
     type=float,
-    help="Minimum seconds between requests to the same domain.",
+    help="Seconds to wait between requests to the same domain.",
+)
+@click.option(
+    "--delay-max",
+    default=None,
+    type=float,
+    help="Upper bound for the per-domain delay (defaults to --delay-min, i.e. a fixed wait).",
 )
 @click.option(
     "--concurrency",
@@ -402,6 +408,7 @@ def scrape_group() -> None:
 def cmd_scrape_run(
     limit: int | None,
     delay_min: float,
+    delay_max: float | None,
     concurrency: int,
 ) -> None:
     """Scrape all pending URLs concurrently.
@@ -410,8 +417,10 @@ def cmd_scrape_run(
     starting with http:// or https:// is added to the urls table).
 
     Requests to different domains run in parallel (up to --concurrency).
-    Requests to the same domain are serialised with a per-domain random delay.
+    Requests to the same domain are serialised with a fixed per-domain delay
+    (or a random delay in [--delay-min, --delay-max] if --delay-max is set).
     """
+    delay_max = delay_max if delay_max is not None else delay_min
     from rich.progress import MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
     from rich.table import Column
 
@@ -431,33 +440,33 @@ def cmd_scrape_run(
         TextColumn("[progress.description]{task.description}"),
         TextColumn(
             "{task.fields[url]}",
-            table_column=Column(no_wrap=False, overflow="crop", ratio=1),
+            table_column=Column(no_wrap=True, overflow="crop", ratio=1),
         ),
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task(f"[red]{0:5.1f}% failed[/red]", total=effective_total, url="")
+        task = progress.add_task(f"[green]{0:5.1f}% failed[/green]", total=effective_total, url="")
 
         _counts = {"failed": 0}
 
         def _on_progress(url: str, status: str, idx: int, total: int) -> None:
             if status != "success":
                 _counts["failed"] += 1
-
             pct = _counts["failed"] / idx * 100 if idx else 0.0
-            textcol = "red" if status != "success" else "green"
-
+            pct_colour = "red" if _counts["failed"] else "green"
+            url_colour = "white" if status == "success" else "red"
             progress.update(
                 task,
                 advance=1,
-                description=f"[red]{pct:5.1f}% failed[/red]",
-                url=f"[{textcol}]{url}[/{textcol}]",
+                description=f"[{pct_colour}]{pct:5.1f}% failed[/{pct_colour}]",
+                url=f"[{url_colour}]{url}[/{url_colour}]",
             )
 
         with get_connection() as con:
             counts = scrape_pending(
                 con,
                 delay_min=delay_min,
+                delay_max=delay_max,
                 concurrency=concurrency,
                 limit=limit,
                 on_progress=_on_progress,
