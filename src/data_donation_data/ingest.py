@@ -13,17 +13,16 @@ Known keys: assignment, task, participant, source, key.
 
 Storage model
 -------------
-Data is stored in long format across three normalised tables:
+Each JSON file contains a **list of single-key objects**: ``[{table_name: [rows...]}, ...]``.
+Each row is a flat dict of ``{field_name: value}`` pairs.
 
-* ``fields``       — one row per unique (source, field) pair; auto-generates
-                     ``field_id``.
-* ``participants`` — one row per unique participant string; auto-generates
-                     ``participant_id``.
-* ``data``         — one row per observation: (field_id, participant_id,
-                     assignment, task, key, value).
+Data is stored in long format across four normalised tables:
 
-URL values (any value starting with ``http://`` or ``https://``) are also
-inserted into the ``urls`` table so the scraper can process them later.
+* ``tables``       — one row per unique (source, table_name) pair.
+* ``fields``       — one row per unique (table_id, field) pair; references ``table_id``.
+* ``participants`` — one row per unique participant string.
+* ``data``         — one non-null cell per (field_id, participant_id, row_index).
+                     Null / sentinel values are **never stored**.
 """
 
 from __future__ import annotations
@@ -268,30 +267,69 @@ def _get_or_create_participant(
     return cache[participant]
 
 
-def _get_or_create_field(
+def _get_or_create_table(
     con: sqlite3.Connection,
     cache: dict[tuple[str, str], int],
     source: str,
-    field: str,
+    table_name: str,
 ) -> int:
-    """Return ``field_id`` for *(source, field)*, inserting a new row if needed."""
-    key = (source, field)
+    """Return ``table_id`` for *(source, table_name)*, inserting if needed."""
+    key = (source, table_name)
     if key not in cache:
         con.execute(
-            "INSERT OR IGNORE INTO fields (source, field) VALUES (?, ?)",
-            (source, field),
+            "INSERT OR IGNORE INTO tables (source, table_name) VALUES (?, ?)",
+            (source, table_name),
         )
         row = con.execute(
-            "SELECT field_id FROM fields WHERE source = ? AND field = ?",
-            (source, field),
+            "SELECT table_id FROM tables WHERE source = ? AND table_name = ?",
+            (source, table_name),
+        ).fetchone()
+        cache[key] = row["table_id"]
+    return cache[key]
+
+
+def _get_or_create_field(
+    con: sqlite3.Connection,
+    cache: dict[tuple[int, str], int],
+    table_id: int,
+    field: str,
+) -> int:
+    """Return ``field_id`` for *(table_id, field)*, inserting if needed."""
+    key = (table_id, field)
+    if key not in cache:
+        con.execute(
+            "INSERT OR IGNORE INTO fields (table_id, field) VALUES (?, ?)",
+            (table_id, field),
+        )
+        row = con.execute(
+            "SELECT field_id FROM fields WHERE table_id = ? AND field = ?",
+            (table_id, field),
         ).fetchone()
         cache[key] = row["field_id"]
     return cache[key]
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _get_or_create_file(
+    con: sqlite3.Connection,
+    cache: dict[tuple, int],
+    participant_id: int,
+    assignment: str | None,
+    task: str | None,
+    file_key: str | None,
+) -> int:
+    """Return ``file_id`` for this file, inserting if needed."""
+    key = (participant_id, file_key)
+    if key not in cache:
+        con.execute(
+            "INSERT OR IGNORE INTO files (participant_id, assignment, task, file_key) VALUES (?, ?, ?, ?)",
+            (participant_id, assignment, task, file_key),
+        )
+        row = con.execute(
+            "SELECT file_id FROM files WHERE participant_id = ? AND file_key = ?",
+            (participant_id, file_key),
+        ).fetchone()
+        cache[key] = row["file_id"]
+    return cache[key]
 
 
 def ingest_donation_directory(
@@ -305,15 +343,13 @@ def ingest_donation_directory(
     Scan *directory* for donation data JSON files and ingest them.
 
     Each ``.json`` file must follow the donation naming convention.  The
-    JSON content can be either a single dict (one record) or a list of
-    dicts (multiple records).  Field names are taken directly from the
-    JSON keys.  Files that cannot be parsed, lack a ``source`` or
-    ``participant`` in their name, or contain non-dict / non-list JSON
-    are silently skipped.
+    JSON content must be a list of single-key objects::
 
-    URL values (starting with ``http://`` or ``https://``) are automatically
-    inserted into the ``urls`` table with ``status='pending'`` so the
-    scraper can process them without a separate queueing step.
+        [{table_name: [row_dict, ...]}, ...]
+
+    Each row dict maps column names to scalar values.  Null values (Python
+    ``None``, ``"null"``, ``"None"``) are **silently skipped** and never
+    stored.  URL values are queued in the ``urls`` table for scraping.
 
     Parameters
     ----------
@@ -340,12 +376,11 @@ def ingest_donation_directory(
     if not files:
         return {"files": 0, "rows": 0, "urls": 0, "skipped": 0}
 
-    # In-memory caches to avoid redundant round-trips for the same
-    # participant / field within a single ingest run.
     participant_cache: dict[str, int] = {}
-    field_cache: dict[tuple[str, str], int] = {}
+    table_cache: dict[tuple[str, str], int] = {}
+    field_cache: dict[tuple[int, str], int] = {}
+    file_cache: dict[tuple, int] = {}
 
-    # Accumulators for batched inserts.
     data_batch: list[tuple] = []
     url_batch: list[tuple] = []
 
@@ -358,7 +393,7 @@ def ingest_donation_directory(
         nonlocal total_rows, total_urls
         if data_batch:
             con.executemany(
-                "INSERT INTO data (field_id, participant_id, assignment, task, key, value) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO data (file_id, field_id, row_index, value) VALUES (?, ?, ?, ?)",
                 data_batch,
             )
             total_rows += len(data_batch)
@@ -387,47 +422,50 @@ def ingest_donation_directory(
             skipped += 1
             continue
 
-        # Normalise to a list of dicts; anything else is unsupported.
-        if isinstance(content, dict):
-            records: list[dict] = [content]
-        elif isinstance(content, list):
-            records = [r for r in content if isinstance(r, dict)]
-        else:
-            skipped += 1
-            continue
-
-        if not records:
+        # Each file is a list of {table_name: [rows...]} objects.
+        if not isinstance(content, list):
             skipped += 1
             continue
 
         participant_id = _get_or_create_participant(con, participant_cache, meta["participant"])
+        assignment = meta.get("assignment")
+        task = meta.get("task")
+        file_key = meta.get("key")
+        file_id = _get_or_create_file(con, file_cache, participant_id, assignment, task, file_key)
+        file_had_data = False
 
-        for record in records:
-            for field_name, raw_value in record.items():
-                # Normalise to NFC so accented field names are stored
-                # consistently regardless of the source JSON encoding.
-                field_name = unicodedata.normalize("NFC", field_name)
-                field_id = _get_or_create_field(con, field_cache, source, field_name)
-                value = _to_db_value(raw_value)
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            for table_name_raw, rows in item.items():
+                table_name = unicodedata.normalize("NFC", table_name_raw)
+                table_id = _get_or_create_table(con, table_cache, source, table_name)
 
-                data_batch.append(
-                    (
-                        field_id,
-                        participant_id,
-                        meta.get("assignment"),
-                        meta.get("task"),
-                        meta.get("key"),
-                        value,
-                    )
-                )
+                if not isinstance(rows, list):
+                    rows = [rows] if isinstance(rows, dict) else []
 
-                # Auto-queue URL values for scraping.
-                if value and _is_url(value):
-                    normalized = normalize_url(value)
-                    if normalized:
-                        url_batch.append((participant_id, field_id, value, normalized))
+                for row_index, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        continue
+                    for field_name_raw, raw_value in row.items():
+                        field_name = unicodedata.normalize("NFC", field_name_raw)
+                        value = _to_db_value(raw_value)
+                        if value is None:  # skip nulls entirely
+                            continue
 
-        total_files += 1
+                        field_id = _get_or_create_field(con, field_cache, table_id, field_name)
+                        data_batch.append((file_id, field_id, row_index, value))
+                        file_had_data = True
+
+                        if _is_url(value):
+                            normalized = normalize_url(value)
+                            if normalized:
+                                url_batch.append((participant_id, field_id, value, normalized))
+
+        if file_had_data:
+            total_files += 1
+        else:
+            skipped += 1
 
         if len(data_batch) >= batch_size:
             _flush()

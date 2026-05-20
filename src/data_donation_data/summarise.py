@@ -3,218 +3,245 @@ Summary helpers for the donation data schema.
 
 Public API
 ----------
-list_tables(con)               → list[str]      — all SQLite tables
-list_sources(con)              → list[str]      — distinct sources in the fields table
-summarise_all_sources(con)     → list[dict]     — source-level rollup stats
-summarise_table(con, table)    → TableSummary   — raw per-column stats for any table
-summarise_source(con, src)     → list[dict]     — per-field stats for a donation source
-participant_field_summary(con) → list[dict]     — long-format source×participant×field counts
+list_tables(con)                       → list[str]   — all SQLite tables
+list_sources(con)                      → list[str]   — distinct sources
+summarise_all_sources(con)             → list[dict]  — source-level stats
+summarise_source(con, src, ...)        → list[dict]  — per-table/field stats
+participant_field_summary(con, ...)    → list[dict]  — participant × field counts
+task_assignment_summary(con, ...)      → list[dict]  — participant counts per task/assignment
 """
 
 from __future__ import annotations
 
 import sqlite3
 import unicodedata
-from dataclasses import dataclass, field
-
-# ---------------------------------------------------------------------------
-# Generic table summary (works on any SQLite table)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ColumnSummary:
-    name: str
-    total: int
-    non_null: int
-    null_count: int
-    null_pct: float
-    distinct: int
-    samples: list[str] = field(default_factory=list)
-
-
-@dataclass
-class TableSummary:
-    table: str
-    row_count: int
-    columns: list[ColumnSummary] = field(default_factory=list)
+from typing import Any
 
 
 def list_tables(con: sqlite3.Connection) -> list[str]:
-    """Return names of all tables in the database (excluding sqlite internals)."""
+    """Return names of all SQLite tables (excluding internals)."""
     rows = con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
     return [r[0] for r in rows]
 
 
-def summarise_table(con: sqlite3.Connection, table: str) -> TableSummary:
-    """
-    Return a :class:`TableSummary` with per-column statistics for *table*.
-
-    Raises
-    ------
-    ValueError
-        If *table* does not exist.
-    """
-    available = list_tables(con)
-    if table not in available:
-        raise ValueError(f"Table '{table}' not found. Available: {', '.join(available) or '(none)'}")
-
-    row_count: int = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
-    col_names = [row[1] for row in con.execute(f'PRAGMA table_info("{table}")').fetchall()]
-
-    summaries: list[ColumnSummary] = []
-    for col in col_names:
-        non_null: int = con.execute(f'SELECT COUNT("{col}") FROM "{table}"').fetchone()[0]
-        null_count = row_count - non_null
-        null_pct = (null_count / row_count * 100) if row_count else 0.0
-        distinct: int = con.execute(f'SELECT COUNT(DISTINCT "{col}") FROM "{table}"').fetchone()[0]
-        sample_rows = con.execute(f'SELECT DISTINCT "{col}" FROM "{table}" WHERE "{col}" IS NOT NULL LIMIT 5').fetchall()
-        summaries.append(
-            ColumnSummary(
-                name=col,
-                total=row_count,
-                non_null=non_null,
-                null_count=null_count,
-                null_pct=round(null_pct, 2),
-                distinct=distinct,
-                samples=[str(r[0]) for r in sample_rows],
-            )
-        )
-
-    return TableSummary(table=table, row_count=row_count, columns=summaries)
-
-
-# ---------------------------------------------------------------------------
-# Donation-data helpers
-# ---------------------------------------------------------------------------
+def list_sources(con: sqlite3.Connection) -> list[str]:
+    """Return distinct source names."""
+    rows = con.execute("SELECT DISTINCT source FROM tables ORDER BY source").fetchall()
+    return [r[0] for r in rows]
 
 
 def summarise_all_sources(con: sqlite3.Connection) -> list[dict]:
     """
-    Return source-level statistics across all donation sources.
+    Return source-level statistics.
 
-    Each dict contains:
+    Each dict contains ``source``, ``n_tables``, ``n_fields``,
+    ``n_participants``, ``n_rows``.
 
-    * ``source``         — source name
-    * ``n_fields``       — number of distinct fields for this source
-    * ``n_participants`` — number of distinct participants with data for this source
-    * ``n_total``        — total observations across all participants and fields
-    * ``n_non_null``     — observations with a non-NULL value
-    * ``pct_non_null``   — percentage non-null (rounded to 1 dp)
+    Implementation notes
+    --------------------
+    The ``data`` table can be very large (100M+ rows).  We avoid a single
+    monolithic join across all of it by splitting into two cheap queries:
+
+    1. **Metadata query** – counts tables and fields from the tiny
+       ``tables`` / ``fields`` tables (no ``data`` scan at all).
+    2. **Stats query** – uses a CTE that first DISTINCT-deduplicates
+       ``data`` down to its ``(field_id, file_id)`` pairs (a much smaller
+       set, ≈ n_fields × n_files) before joining to ``files`` for
+       participant counts.  The ``idx_data_cover`` index on
+       ``data(field_id, file_id)`` means this step is a covering-index
+       scan with no heap access.
     """
-    rows = con.execute(
+    # --- 1. metadata: n_tables and n_fields per source (no data scan) ---
+    meta_rows = con.execute(
         """
         SELECT
-            f.source,
-            COUNT(DISTINCT f.field_id)                   AS n_fields,
-            COUNT(DISTINCT d.participant_id)              AS n_participants,
-            COUNT(*)                                      AS n_total,
-            COUNT(d.value)                               AS n_non_null,
-            ROUND(100.0 * COUNT(d.value) / COUNT(*), 1)  AS pct_non_null
-        FROM fields f
-        JOIN data d ON d.field_id = f.field_id
-        GROUP BY f.source
-        ORDER BY f.source
+            t.source,
+            COUNT(DISTINCT t.table_id) AS n_tables,
+            COUNT(DISTINCT f.field_id) AS n_fields
+        FROM tables t
+        JOIN fields f ON f.table_id = t.table_id
+        GROUP BY t.source
         """
     ).fetchall()
-    return [dict(row) for row in rows]
 
+    meta: dict[str, dict] = {}
+    for row in meta_rows:
+        meta[row["source"]] = {
+            "source": row["source"],
+            "n_tables": row["n_tables"],
+            "n_fields": row["n_fields"],
+            "n_participants": 0,
+            "n_rows": 0,
+        }
 
-def list_sources(con: sqlite3.Connection) -> list[str]:
-    """Return the distinct source names present in the ``fields`` table."""
-    rows = con.execute("SELECT DISTINCT source FROM fields ORDER BY source").fetchall()
-    return [r[0] for r in rows]
+    # --- 2. stats: n_participants and n_rows per source ---
+    # The CTE collapses 122M+ data rows to distinct (field_id, file_id)
+    # pairs first (using idx_data_cover), then joins the tiny fields /
+    # tables / files tables to resolve source and participant.
+    stats_rows = con.execute(
+        """
+        WITH deduped AS (
+            SELECT DISTINCT field_id, file_id
+            FROM data
+        )
+        SELECT
+            t.source,
+            COUNT(DISTINCT fi.participant_id) AS n_participants
+        FROM deduped d
+        JOIN fields f  ON f.field_id  = d.field_id
+        JOIN tables t  ON t.table_id  = f.table_id
+        JOIN files  fi ON fi.file_id  = d.file_id
+        GROUP BY t.source
+        """
+    ).fetchall()
+
+    # n_rows is a simple COUNT(*) — reuse a separate lightweight query
+    rows_rows = con.execute(
+        """
+        SELECT t.source, COUNT(*) AS n_rows
+        FROM data d
+        JOIN fields f ON f.field_id = d.field_id
+        JOIN tables t ON t.table_id = f.table_id
+        GROUP BY t.source
+        """
+    ).fetchall()
+
+    for row in stats_rows:
+        src = row["source"]
+        if src in meta:
+            meta[src]["n_participants"] = row["n_participants"]
+
+    for row in rows_rows:
+        src = row["source"]
+        if src in meta:
+            meta[src]["n_rows"] = row["n_rows"]
+
+    return sorted(meta.values(), key=lambda r: r["source"])
 
 
 def summarise_source(
     con: sqlite3.Connection,
     source: str,
-    alias_map: dict[str, dict[str, str]] | None = None,
-    exclusion_set: dict[str, frozenset[str]] | None = None,
+    alias_map: dict[str, dict[str, dict[str, str]]] | None = None,
+    exclusion_set: dict[str, dict[str, frozenset[str]]] | None = None,
+    table_alias_map: dict[str, dict[str, str]] | None = None,
 ) -> list[dict]:
     """
-    Return per-field statistics for a donation *source*.
+    Return per-table, per-field statistics for *source*.
 
-    Each dict contains:
+    Returns a list of table dicts, each containing:
 
-    * ``field``          — field name (canonical, after alias mapping)
-    * ``n_total``        — total observations across all participants
-    * ``n_non_null``     — observations with a non-NULL value
-    * ``pct_non_null``   — percentage non-null (rounded to 1 dp)
-    * ``n_participants`` — number of distinct participants with this field
-                           (may be an overcount when aliases are merged)
+    * ``table``  — table name (canonical after .alias; merged if multiple tables share one)
+    * ``fields`` — list of field dicts:
+
+        * ``field``         — field name (canonical after alias)
+        * ``n_participants`` — distinct participants with this field
+        * ``n_rows``         — total non-null cell values stored
 
     Parameters
     ----------
     alias_map:
-        Optional ``{source: {alias → canonical}}`` mapping produced by
-        ``export.build_alias_map``.  When supplied, field names that appear
-        as aliases are renamed to their canonical name and their statistics
-        are summed together.
+        ``{source: {table_name: {original_field: canonical_field}}}``
     exclusion_set:
-        Optional ``{source: frozenset(field_names)}`` mapping of fields to
-        exclude from the summary (by original field name, before aliasing).
-        Produced by ``export.build_exclusion_set``.
+        ``{source: {table_name: frozenset(excluded_fields)}}``
 
     Raises
     ------
     ValueError
-        If *source* is not found in the ``fields`` table.
+        If *source* is not found.
     """
     available = list_sources(con)
     if source not in available:
         raise ValueError(f"Source '{source}' not found. Available: {', '.join(available) or '(none)'}")
 
-    rows = con.execute(
+    # --- 1. metadata: field names and table names (no data scan) ---
+    meta_rows = con.execute(
         """
-        SELECT
-            f.field,
-            COUNT(*)                                    AS n_total,
-            COUNT(d.value)                              AS n_non_null,
-            COUNT(DISTINCT d.participant_id)             AS n_participants
+        SELECT f.field_id, f.field, t.table_name
         FROM fields f
-        JOIN data d ON d.field_id = f.field_id
-        WHERE f.source = ?
-        GROUP BY f.field_id
-        ORDER BY f.field
+        JOIN tables t ON t.table_id = f.table_id
+        WHERE t.source = ?
+        ORDER BY t.table_name, f.field
         """,
         (source,),
     ).fetchall()
 
-    # Filter excluded fields (by original field name, before aliasing).
-    # Normalise to NFC so YAML-sourced names match DB fields regardless of
-    # how the original JSON files encoded their accented characters.
-    excluded_fields = frozenset(unicodedata.normalize("NFC", f) for f in (exclusion_set or {}).get(source, frozenset()))
-    if excluded_fields:
-        rows = [r for r in rows if unicodedata.normalize("NFC", r["field"]) not in excluded_fields]
+    # --- 2. n_participants and n_rows per field ---
+    # per_file groups by (field_id, file_id) — matching idx_data_cover's sort
+    # order, so the CTE streams without a temp sort.  The outer aggregation
+    # then works on ≈111K pairs rather than 122M+ raw rows.
+    stats_rows = con.execute(
+        """
+        WITH src_fields AS (
+            SELECT f.field_id
+            FROM fields f
+            JOIN tables t ON t.table_id = f.table_id
+            WHERE t.source = ?
+        ),
+        per_file AS (
+            SELECT d.field_id, d.file_id, COUNT(*) AS n_rows
+            FROM data d
+            WHERE d.field_id IN (SELECT field_id FROM src_fields)
+            GROUP BY d.field_id, d.file_id
+        )
+        SELECT
+            pf.field_id,
+            SUM(pf.n_rows)                   AS n_rows,
+            COUNT(DISTINCT fi.participant_id) AS n_participants
+        FROM per_file pf
+        JOIN files fi ON fi.file_id = pf.file_id
+        GROUP BY pf.field_id
+        """,
+        (source,),
+    ).fetchall()
 
-    # Apply alias mapping and aggregate rows with the same canonical name.
-    source_aliases = (alias_map or {}).get(source, {})
-    aggregated: dict[str, dict] = {}
-    for row in rows:
-        nfc_field = unicodedata.normalize("NFC", row["field"])
-        canonical = source_aliases.get(nfc_field, nfc_field)
-        if canonical in aggregated:
-            aggregated[canonical]["n_total"] += row["n_total"]
-            aggregated[canonical]["n_non_null"] += row["n_non_null"]
-            # n_participants may overcount when aliases are merged (a participant
-            # could appear in both the aliased and canonical field).
-            aggregated[canonical]["n_participants"] += row["n_participants"]
+    stats: dict[int, sqlite3.Row] = {row["field_id"]: row for row in stats_rows}
+
+    src_aliases = (alias_map or {}).get(source, {})
+    src_exclusions = (exclusion_set or {}).get(source, {})
+
+    # Group by table, apply alias + exclusion.
+    tables_out: dict[str, dict[str, dict[str, Any]]] = {}
+
+    src_table_aliases: dict[str, str] = table_alias_map.get(source, {}) if table_alias_map else {}
+
+    for row in meta_rows:
+        field_id = row["field_id"]
+        tbl: str = row["table_name"]
+        canonical_table: str = src_table_aliases.get(tbl, tbl)
+        orig_nfc = unicodedata.normalize("NFC", row["field"])
+
+        # Skip excluded fields (keyed by original table name).
+        if orig_nfc in src_exclusions.get(tbl, frozenset()):
+            continue
+
+        # Field alias lookup uses original table name (YAML is keyed that way).
+        canonical_field = src_aliases.get(tbl, {}).get(orig_nfc, orig_nfc)
+
+        if canonical_table not in tables_out:
+            tables_out[canonical_table] = {}
+
+        field_stats = stats.get(field_id)
+        n_participants = field_stats["n_participants"] if field_stats else 0
+        n_rows = field_stats["n_rows"] if field_stats else 0
+
+        if canonical_field in tables_out[canonical_table]:
+            tables_out[canonical_table][canonical_field]["n_participants"] += n_participants
+            tables_out[canonical_table][canonical_field]["n_rows"] += n_rows
         else:
-            aggregated[canonical] = {
-                "field": canonical,
-                "n_total": row["n_total"],
-                "n_non_null": row["n_non_null"],
-                "n_participants": row["n_participants"],
+            tables_out[canonical_table][canonical_field] = {
+                "field": canonical_field,
+                "n_participants": n_participants,
+                "n_rows": n_rows,
             }
 
-    # Recalculate pct_non_null after aggregation.
-    result = []
-    for entry in aggregated.values():
-        entry["pct_non_null"] = round(100.0 * entry["n_non_null"] / entry["n_total"], 1) if entry["n_total"] > 0 else 0.0
-        result.append(entry)
-
-    return sorted(result, key=lambda r: r["field"])
+    return [
+        {
+            "table": tbl,
+            "fields": sorted(fields.values(), key=lambda f: f["field"]),
+        }
+        for tbl, fields in sorted(tables_out.items())
+    ]
 
 
 def task_assignment_summary(
@@ -225,22 +252,8 @@ def task_assignment_summary(
     """
     Return participant counts grouped by (task, assignment).
 
-    Each dict contains:
-
-    * ``task``            — task identifier as stored in the data
-    * ``task_name``       — human-readable task name (from *task_names*) or ``""``
-    * ``assignment``      — assignment identifier as stored in the data
-    * ``assignment_name`` — human-readable assignment name (from *assignment_names*) or ``""``
-    * ``n_participants``  — number of distinct participants with data in this (task, assignment)
-
-    Parameters
-    ----------
-    task_names:
-        Optional ``{task_id: name}`` mapping (from ``load_export_yaml``).
-    assignment_names:
-        Optional ``{assignment_id: name}`` mapping (from ``load_export_yaml``).
-
-    Sorted by task → assignment.
+    Each dict: ``task``, ``task_name``, ``assignment``, ``assignment_name``,
+    ``n_participants``.
     """
     rows = con.execute(
         """
@@ -248,7 +261,7 @@ def task_assignment_summary(
             task,
             assignment,
             COUNT(DISTINCT participant_id) AS n_participants
-        FROM data
+        FROM files
         GROUP BY task, assignment
         ORDER BY task, assignment
         """
@@ -275,79 +288,57 @@ def task_assignment_summary(
 
 def participant_field_summary(
     con: sqlite3.Connection,
-    alias_map: dict[str, dict[str, str]] | None = None,
-    exclusion_set: dict[str, frozenset[str]] | None = None,
+    alias_map: dict[str, dict[str, dict[str, str]]] | None = None,
+    exclusion_set: dict[str, dict[str, frozenset[str]]] | None = None,
 ) -> list[dict]:
     """
-    Compute a long-format summary across all donation sources.
+    Long-format summary: one row per (source, table, participant, field).
 
-    For every (source, participant, field) combination returns:
-
-    * ``source``      — data source name
-    * ``participant`` — participant identifier
-    * ``field``       — field name (canonical, after alias mapping)
-    * ``n_non_null``  — number of non-NULL values (SQL COUNT ignores NULLs)
-    * ``n_total``     — total rows for this participant × field
-
-    Parameters
-    ----------
-    alias_map:
-        Optional ``{source: {alias → canonical}}`` mapping produced by
-        ``export.build_alias_map``.  When supplied, rows whose field name
-        is an alias are renamed to the canonical name and their counts are
-        summed with any existing row for that canonical name.
-    exclusion_set:
-        Optional ``{source: frozenset(field_names)}`` mapping of fields to
-        exclude from the summary (by original field name, before aliasing).
-        Produced by ``export.build_exclusion_set``.
-
-    Sorted by source → participant → field.
+    Each dict: ``source``, ``table``, ``participant``, ``field``, ``n_rows``.
     """
     rows = con.execute(
         """
         SELECT
-            f.source,
+            t.source,
+            t.table_name,
             p.participant,
             f.field,
-            COUNT(d.value) AS n_non_null,
-            COUNT(*)       AS n_total
+            COUNT(*) AS n_rows
         FROM data d
-        JOIN fields      f ON d.field_id       = f.field_id
-        JOIN participants p ON d.participant_id = p.participant_id
-        GROUP BY d.field_id, d.participant_id
-        ORDER BY f.source, p.participant, f.field
+        JOIN files        fi ON fi.file_id       = d.file_id
+        JOIN fields       f  ON d.field_id        = f.field_id
+        JOIN tables       t  ON f.table_id         = t.table_id
+        JOIN participants p  ON fi.participant_id   = p.participant_id
+        GROUP BY f.field_id, fi.participant_id
+        ORDER BY t.source, t.table_name, p.participant, f.field
         """
     ).fetchall()
 
-    # Filter excluded fields per source (NFC-normalised for accent safety).
-    if exclusion_set:
-        nfc_exclusion = {
-            src: frozenset(unicodedata.normalize("NFC", f) for f in fields) for src, fields in exclusion_set.items()
-        }
-        rows = [r for r in rows if unicodedata.normalize("NFC", r["field"]) not in nfc_exclusion.get(r["source"], frozenset())]
-
-    # Apply alias mapping and aggregate rows that collapse to the same key.
     aggregated: dict[tuple, dict] = {}
     for row in rows:
-        source = row["source"]
-        source_aliases = (alias_map or {}).get(source, {})
-        nfc_field = unicodedata.normalize("NFC", row["field"])
-        canonical = source_aliases.get(nfc_field, nfc_field)
-        key = (source, row["participant"] or "", canonical)
+        src = row["source"]
+        tbl = row["table_name"]
+        orig_nfc = unicodedata.normalize("NFC", row["field"])
+
+        # Skip excluded.
+        if orig_nfc in (exclusion_set or {}).get(src, {}).get(tbl, frozenset()):
+            continue
+
+        canonical = (alias_map or {}).get(src, {}).get(tbl, {}).get(orig_nfc, orig_nfc)
+        key = (src, tbl, row["participant"] or "", canonical)
 
         if key in aggregated:
-            aggregated[key]["n_non_null"] += row["n_non_null"]
-            aggregated[key]["n_total"] += row["n_total"]
+            aggregated[key]["n_rows"] += row["n_rows"]
         else:
             aggregated[key] = {
-                "source": source,
+                "source": src,
+                "table": tbl,
                 "participant": row["participant"],
                 "field": canonical,
-                "n_non_null": row["n_non_null"],
-                "n_total": row["n_total"],
+                "n_rows": row["n_rows"],
             }
 
     return sorted(
         aggregated.values(),
-        key=lambda r: (r["source"], r["participant"] or "", r["field"]),
+        key=lambda r: (r["source"], r["table"], r["participant"] or "", r["field"]),
     )

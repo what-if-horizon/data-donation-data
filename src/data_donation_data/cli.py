@@ -12,7 +12,8 @@ ddd summarise <table>
 ddd summarise-source <source>
 ddd field-summary [--output FILE]
 ddd participant-summary [--output FILE]
-ddd extract <table> <col>... [--output FILE] [--format csv|jsonl] [--where CLAUSE]
+ddd export [SOURCE...] [--output FILE] [--format csv|jsonl] [--all] [--assignment ID] [--task ID]
+ddd export-aliases [--output FILE]
 ddd remove [--assignment ID] [--task ID] [--participant ID] [--yes]
 ddd create-config [--output FILE]
 ddd scrape run [--limit N] [--delay-min S] [--delay-max S] [--concurrency N]
@@ -31,7 +32,6 @@ from rich.table import Table as RichTable
 
 from data_donation_data.db import db_path, get_connection
 from data_donation_data.export import DEFAULT_YAML_PATH, init_export_yaml
-from data_donation_data.extract import extract_to_csv, extract_to_jsonl
 from data_donation_data.ingest import ingest_donation_directory
 from data_donation_data.scraper import scrape_pending
 from data_donation_data.summarise import (
@@ -51,12 +51,10 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
-def _try_load_alias_map() -> dict[str, dict[str, str]]:
+def _try_load_alias_map() -> dict:
     """
     Load alias mappings from ``ddd_export.yaml`` if it exists.
-
-    Returns an empty dict (no aliases) when the file is absent or invalid,
-    so callers never have to handle a missing config file specially.
+    Returns ``{}`` when the file is absent or invalid.
     """
     try:
         from data_donation_data.export import build_alias_map, load_export_yaml
@@ -69,9 +67,7 @@ def _try_load_alias_map() -> dict[str, dict[str, str]]:
 def _try_load_export_config() -> dict:
     """
     Load the full export config from ``ddd_export.yaml`` if it exists.
-
-    Returns ``{"tasks": {}, "assignments": {}, "sources": {}}`` when the
-    file is absent or invalid.
+    Returns ``{"tasks": {}, "assignments": {}, "sources": {}}`` when absent.
     """
     try:
         from data_donation_data.export import load_export_yaml
@@ -81,15 +77,28 @@ def _try_load_export_config() -> dict:
         return {"tasks": {}, "assignments": {}, "sources": {}}
 
 
-def _try_load_exclusion_set() -> dict[str, frozenset[str]]:
+def _try_load_exclusion_set() -> dict:
     """
     Load per-source exclusion sets from ``ddd_export.yaml`` if it exists.
-    Returns an empty dict when the file is absent or invalid.
+    Returns ``{}`` when the file is absent or invalid.
     """
     try:
         from data_donation_data.export import build_exclusion_set, load_export_yaml
 
         return build_exclusion_set(load_export_yaml(DEFAULT_YAML_PATH))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _try_load_table_alias_map() -> dict:
+    """
+    Load table alias mappings from ``ddd_export.yaml`` if it exists.
+    Returns ``{}`` when the file is absent or invalid.
+    """
+    try:
+        from data_donation_data.export import build_table_alias_map, load_export_yaml
+
+        return build_table_alias_map(load_export_yaml(DEFAULT_YAML_PATH))
     except (FileNotFoundError, ValueError):
         return {}
 
@@ -212,20 +221,18 @@ def cmd_summarise() -> None:
 
     t = RichTable(title="Source summary", show_lines=True)
     t.add_column("Source", style="cyan", no_wrap=True)
+    t.add_column("Tables", justify="right")
     t.add_column("Fields", justify="right")
     t.add_column("Participants", justify="right")
-    t.add_column("Observations", justify="right")
-    t.add_column("Non-null", justify="right")
-    t.add_column("Non-null %", justify="right")
+    t.add_column("Rows", justify="right")
 
     for row in rows:
         t.add_row(
             row["source"],
+            f"{row['n_tables']:,}",
             f"{row['n_fields']:,}",
             f"{row['n_participants']:,}",
-            f"{row['n_total']:,}",
-            f"{row['n_non_null']:,}",
-            f"{row['pct_non_null']:.1f}%",
+            f"{row['n_rows']:,}",
         )
 
     console.print(t)
@@ -253,42 +260,45 @@ def cmd_summarise_source(source: str, show_all: bool, no_alias: bool) -> None:
         exclusion_set = {}
     if no_alias:
         alias_map = {}
+    table_alias_map = {} if no_alias else _try_load_table_alias_map()
     with get_connection() as con:
         try:
-            rows = summarise_source(con, source, alias_map=alias_map, exclusion_set=exclusion_set)
+            table_rows = summarise_source(
+                con,
+                source,
+                alias_map=alias_map,
+                exclusion_set=exclusion_set,
+                table_alias_map=table_alias_map,
+            )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
 
-    if not rows:
+    if not table_rows:
         console.print(f"[yellow]No data found for source '{source}'.[/yellow]")
         return
 
-    total_rows = sum(r["n_total"] for r in rows)
+    n_tables = len(table_rows)
+    n_fields = sum(len(t["fields"]) for t in table_rows)
+    n_rows = sum(f["n_rows"] for t in table_rows for f in t["fields"])
     alias_note = " [dim](aliases applied)[/dim]" if alias_map.get(source) else ""
     console.print(
         f"\n[bold]Source:[/bold] [cyan]{source}[/cyan]  "
-        f"[bold]Fields:[/bold] {len(rows)}  "
-        f"[bold]Total observations:[/bold] {total_rows:,}"
+        f"[bold]Tables:[/bold] {n_tables}  "
+        f"[bold]Fields:[/bold] {n_fields}  "
+        f"[bold]Total rows:[/bold] {n_rows:,}"
         f"{alias_note}\n"
     )
 
-    t = RichTable(show_lines=True)
-    t.add_column("Field", style="cyan", no_wrap=True)
-    t.add_column("Observations", justify="right")
-    t.add_column("Non-null", justify="right")
-    t.add_column("Non-null %", justify="right")
-    t.add_column("Participants", justify="right")
-
-    for row in rows:
-        t.add_row(
-            row["field"],
-            f"{row['n_total']:,}",
-            f"{row['n_non_null']:,}",
-            f"{row['pct_non_null']:.1f}%",
-            f"{row['n_participants']:,}",
-        )
-
-    console.print(t)
+    for tbl in table_rows:
+        console.print(f"[bold yellow]{tbl['table']}[/bold yellow]")
+        t = RichTable(show_lines=False, box=None, padding=(0, 1))
+        t.add_column("Field", style="cyan", no_wrap=True)
+        t.add_column("Participants", justify="right")
+        t.add_column("Rows", justify="right")
+        for f in tbl["fields"]:
+            t.add_row(f["field"], f"{f['n_participants']:,}", f"{f['n_rows']:,}")
+        console.print(t)
+        console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +404,7 @@ def cmd_field_summary(output: Path | None, show_all: bool, no_alias: bool) -> No
         console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
         return
 
-    fieldnames = ["source", "participant", "field", "n_non_null", "n_total"]
+    fieldnames = ["source", "table", "participant", "field", "n_rows"]
 
     if output is None:
         writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, lineterminator="\n")
@@ -409,19 +419,19 @@ def cmd_field_summary(output: Path | None, show_all: bool, no_alias: bool) -> No
 
 
 # ---------------------------------------------------------------------------
-# ddd extract
+# ddd export
 # ---------------------------------------------------------------------------
 
 
-@cli.command("extract")
-@click.argument("table")
-@click.argument("columns", nargs=-1, required=True)
+@cli.command("export")
+@click.argument("sources", nargs=-1, required=False)
 @click.option(
     "--output",
     "-o",
     type=click.Path(path_type=Path),
-    default=None,
-    help="Output file path. Defaults to stdout.",
+    default="ddd_export_data.csv",
+    show_default=True,
+    help="Output file path.",
 )
 @click.option(
     "--format",
@@ -432,30 +442,201 @@ def cmd_field_summary(output: Path | None, show_all: bool, no_alias: bool) -> No
     help="Output format.",
 )
 @click.option(
-    "--where",
-    default=None,
-    help="Optional SQL WHERE clause (without the WHERE keyword).",
+    "--all",
+    "include_all",
+    is_flag=True,
+    default=False,
+    help="Include fields marked as .excluded in ddd_export.yaml.",
 )
-def cmd_extract(
-    table: str,
-    columns: tuple[str, ...],
+@click.option(
+    "--assignment",
+    "-a",
+    default=None,
+    help="Filter rows to this assignment ID.",
+)
+@click.option(
+    "--task",
+    "-t",
+    default=None,
+    help="Filter rows to this task ID.",
+)
+def cmd_export(
+    sources: tuple[str, ...],
     output: Path | None,
     fmt: str,
-    where: str | None,
+    include_all: bool,
+    assignment: str | None,
+    task: str | None,
 ) -> None:
-    """Extract COLUMNS from TABLE to CSV or JSONL."""
-    col_list = list(columns)
-    with get_connection() as con:
-        try:
-            if fmt == "csv":
-                n = extract_to_csv(con, table, col_list, output=output, where=where)
-            else:
-                n = extract_to_jsonl(con, table, col_list, output=output, where=where)
-        except ValueError as exc:
-            raise click.ClickException(str(exc)) from exc
+    """Export ingested data to CSV or JSONL with aliases applied.
 
-    if output:
-        console.print(f"[green]✓[/green] Wrote [bold]{n:,}[/bold] rows to [cyan]{output}[/cyan]")
+    Exports all sources by default. Pass one or more SOURCE names to
+    limit the export to those sources only.
+
+    Each row contains: source, participant, assignment, task,
+    field (canonical alias), original_field, key, value.
+
+    Fields listed under .excluded in ddd_export.yaml are skipped unless
+    --all is given. Aliases from ddd_export.yaml are applied automatically
+    when the config file exists.
+
+    Examples:
+
+    \b
+      ddd export                          # all sources → ddd_export_data.csv
+      ddd export facebook instagram       # specific sources
+      ddd export --all                    # include excluded fields
+      ddd export -o out.csv               # write to custom file
+      ddd export --format jsonl -o out.jsonl
+      ddd export -a 359                   # filter by assignment
+      ddd export -t 940                   # filter by task
+    """
+    import json
+
+    from data_donation_data.export import export_data
+
+    config = _try_load_export_config()
+    has_config = bool(config.get("sources"))
+
+    src_list = list(sources) if sources else None
+
+    with get_connection() as con:
+        # Validate requested sources exist.
+        if src_list:
+            known = {row["source"] for row in con.execute("SELECT DISTINCT source FROM fields").fetchall()}
+            bad = [s for s in src_list if s not in known]
+            if bad:
+                raise click.ClickException(f"Unknown source(s): {', '.join(bad)}. Known sources: {', '.join(sorted(known))}")
+
+        columns, rows = export_data(
+            con,
+            src_list,
+            include_all=include_all,
+            config=config,
+            assignment=assignment,
+            task=task,
+        )
+
+    if not rows:
+        click.echo("No rows matched the given filters.", err=True)
+        return
+
+    # ------------------------------------------------------------------
+    # Write output
+    # ------------------------------------------------------------------
+    if not has_config:
+        click.echo(
+            "Note: no ddd_export.yaml found — run `ddd create-config` "
+            "to generate one. Aliases and exclusions are not applied.",
+            err=True,
+        )
+    elif include_all:
+        click.echo(
+            "--all: exporting all fields, including those marked .excluded.",
+            err=True,
+        )
+
+    if fmt == "csv":
+        with output.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
+    else:  # jsonl
+        with output.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    console.print(f"[green]✓[/green] Wrote [bold]{len(rows):,}[/bold] rows to [cyan]{output}[/cyan]")
+    sources_in_output = sorted({r["source"] for r in rows if r["source"] is not None})
+    console.print(f"   Sources: [cyan]{', '.join(sources_in_output)}[/cyan]")
+
+
+# ---------------------------------------------------------------------------
+# ddd export-aliases
+# ---------------------------------------------------------------------------
+
+
+@cli.command("export-aliases")
+@click.option(
+    "--output",
+    "-o",
+    default="ddd_aliases.csv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="Output CSV file.",
+)
+def cmd_export_aliases(output: Path) -> None:
+    """Export a CSV mapping every field to its canonical alias.
+
+    Writes one row per field in the database with columns:
+
+    \b
+      field_id       — internal field identifier
+      source         — data source (e.g. facebook, youtube)
+      table          — canonical table name (after .alias from ddd_export.yaml)
+      original_field — raw field name as stored in the DB
+      alias          — canonical field name (after field alias from ddd_export.yaml)
+
+    This is useful for auditing which fields map to which aliases before
+    running a full export, and for cross-referencing field_id values that
+    appear in exported data.
+
+    Run `ddd create-config` first to generate ddd_export.yaml.
+    """
+    import unicodedata
+
+    from data_donation_data.export import build_alias_map, build_table_alias_map, load_export_yaml
+
+    # Load config (gracefully absent).
+    try:
+        config = load_export_yaml(DEFAULT_YAML_PATH)
+    except (FileNotFoundError, ValueError):
+        config = {"tasks": {}, "assignments": {}, "sources": {}}
+        console.print(
+            "[yellow]Warning:[/yellow] ddd_export.yaml not found — "
+            "aliases will not be applied. Run `ddd create-config` first.",
+            err=True,
+        )
+
+    alias_map = build_alias_map(config)
+    table_alias_map = build_table_alias_map(config)
+
+    with get_connection() as con:
+        rows = con.execute(
+            """
+            SELECT f.field_id, t.source, t.table_name, f.field
+            FROM fields f
+            JOIN tables t ON t.table_id = f.table_id
+            ORDER BY t.source, t.table_name, f.field
+            """
+        ).fetchall()
+
+    with output.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["field_id", "source", "table", "original_field", "alias"],
+        )
+        writer.writeheader()
+        for row in rows:
+            src: str = row["source"]
+            tbl: str = row["table_name"]
+            field: str = row["field"]
+            field_nfc = unicodedata.normalize("NFC", field)
+
+            canonical_table = table_alias_map.get(src, {}).get(tbl, tbl)
+            canonical_field = alias_map.get(src, {}).get(tbl, {}).get(field_nfc, field_nfc)
+
+            writer.writerow(
+                {
+                    "field_id": row["field_id"],
+                    "source": src,
+                    "table": canonical_table,
+                    "original_field": field,
+                    "alias": canonical_field,
+                }
+            )
+
+    console.print(f"[green]✓[/green] Wrote [bold]{len(rows):,}[/bold] field aliases to [cyan]{output}[/cyan]")
 
 
 # ---------------------------------------------------------------------------
@@ -494,21 +675,21 @@ def cmd_remove(
     if not any([assignment, task, participant]):
         raise click.ClickException("Provide at least one of --assignment, --task, --participant.")
 
-    # Build a parameterised WHERE clause that works with the data+participants join.
+    # Build a parameterised WHERE clause against the files+participants join.
     conditions: list[str] = []
     params: list[str] = []
     if assignment is not None:
-        conditions.append("d.assignment = ?")
+        conditions.append("fi.assignment = ?")
         params.append(assignment)
     if task is not None:
-        conditions.append("d.task = ?")
+        conditions.append("fi.task = ?")
         params.append(task)
     if participant is not None:
         conditions.append("p.participant = ?")
         params.append(participant)
 
     where = " AND ".join(conditions)
-    join = "FROM data d JOIN participants p ON d.participant_id = p.participant_id"
+    join = "FROM data d JOIN files fi ON fi.file_id = d.file_id JOIN participants p ON p.participant_id = fi.participant_id"
 
     with get_connection() as con:
         n_rows = con.execute(f"SELECT COUNT(*) {join} WHERE {where}", params).fetchone()[0]
@@ -520,12 +701,12 @@ def cmd_remove(
         # Gather preview details.
         affected = con.execute(
             f"""
-            SELECT d.assignment, d.task, p.participant,
+            SELECT fi.assignment, fi.task, p.participant,
                    COUNT(*) AS n_rows
             {join}
             WHERE {where}
-            GROUP BY d.assignment, d.task, p.participant
-            ORDER BY d.assignment, d.task, p.participant
+            GROUP BY fi.assignment, fi.task, p.participant
+            ORDER BY fi.assignment, fi.task, p.participant
             """,
             params,
         ).fetchall()
@@ -554,7 +735,7 @@ def cmd_remove(
 
         # Remember which participants are affected before deleting.
         affected_pids: list[int] = [
-            r[0] for r in con.execute(f"SELECT DISTINCT p.participant_id {join} WHERE {where}", params).fetchall()
+            r[0] for r in con.execute(f"SELECT DISTINCT fi.participant_id {join} WHERE {where}", params).fetchall()
         ]
 
         # Delete matching data rows.
@@ -582,8 +763,8 @@ def cmd_remove(
             file_params,
         ).rowcount
 
-        # Clean up participants that now have no data at all.
-        orphaned_pids: list[int] = []
+        # Clean up orphaned files, then participants with no files left.
+        con.execute("DELETE FROM files WHERE file_id NOT IN (SELECT DISTINCT file_id FROM data)")
         if affected_pids:
             ph = ",".join("?" * len(affected_pids))
             orphaned_pids: list[int] = [
@@ -591,7 +772,7 @@ def cmd_remove(
                 for r in con.execute(
                     f"SELECT participant_id FROM participants "
                     f"WHERE participant_id IN ({ph}) "
-                    f"AND participant_id NOT IN (SELECT DISTINCT participant_id FROM data)",
+                    f"AND participant_id NOT IN (SELECT DISTINCT participant_id FROM files)",
                     affected_pids,
                 ).fetchall()
             ]
@@ -600,8 +781,9 @@ def cmd_remove(
                 con.execute(f"DELETE FROM urls         WHERE participant_id IN ({oph})", orphaned_pids)
                 con.execute(f"DELETE FROM participants WHERE participant_id IN ({oph})", orphaned_pids)
 
-        # Clean up fields that now have no data at all.
+        # Clean up fields and tables that now have no data at all.
         n_fields = con.execute("DELETE FROM fields WHERE field_id NOT IN (SELECT DISTINCT field_id FROM data)").rowcount
+        con.execute("DELETE FROM tables WHERE table_id NOT IN (SELECT DISTINCT table_id FROM fields)")
 
         con.commit()
 
