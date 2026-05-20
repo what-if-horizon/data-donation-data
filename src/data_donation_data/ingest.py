@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -304,12 +305,11 @@ def ingest_donation_directory(
     Scan *directory* for donation data JSON files and ingest them.
 
     Each ``.json`` file must follow the donation naming convention.  The
-    JSON content must be an array of *table objects*: each table object
-    contains one key whose value is a list of row dicts (the table data)
-    plus optional scalar metadata fields (e.g. ``"deleted row count"``) that
-    are ignored.  Field names are stored as ``"TableName.column_name"``.
-    Files that cannot be parsed or lack a ``source`` or ``participant`` in
-    their name are silently skipped.
+    JSON content can be either a single dict (one record) or a list of
+    dicts (multiple records).  Field names are taken directly from the
+    JSON keys.  Files that cannot be parsed, lack a ``source`` or
+    ``participant`` in their name, or contain non-dict / non-list JSON
+    are silently skipped.
 
     URL values (starting with ``http://`` or ``https://``) are automatically
     inserted into the ``urls`` table with ``status='pending'`` so the
@@ -329,7 +329,7 @@ def ingest_donation_directory(
     Returns
     -------
     dict
-        ``{"files": n, "rows": n, "urls": n, "skipped": n, "already_ingested": n}``.
+        ``{"files": n, "rows": n, "urls": n, "skipped": n}``.
     """
     if not directory.is_dir():
         raise ValueError(f"{directory} is not a directory")
@@ -353,7 +353,6 @@ def ingest_donation_directory(
     total_rows = 0
     total_urls = 0
     skipped = 0
-    already_ingested = 0
 
     def _flush() -> None:
         nonlocal total_rows, total_urls
@@ -379,11 +378,6 @@ def ingest_donation_directory(
             skipped += 1
             continue
 
-        # Skip files that have already been ingested.
-        if con.execute("SELECT 1 FROM ingested_files WHERE file_stem = ?", (path.stem,)).fetchone():
-            already_ingested += 1
-            continue
-
         source = meta["source"].lower()
 
         try:
@@ -393,55 +387,47 @@ def ingest_donation_directory(
             skipped += 1
             continue
 
-        # Each file is a JSON array of table objects.
-        # Each table object has one key whose value is a list (the table rows)
-        # plus optional metadata keys with scalar values (e.g. "deleted row count").
-        if not isinstance(content, list):
+        # Normalise to a list of dicts; anything else is unsupported.
+        if isinstance(content, dict):
+            records: list[dict] = [content]
+        elif isinstance(content, list):
+            records = [r for r in content if isinstance(r, dict)]
+        else:
             skipped += 1
             continue
 
-        table_objects = [item for item in content if isinstance(item, dict)]
-        if not table_objects:
+        if not records:
             skipped += 1
             continue
 
         participant_id = _get_or_create_participant(con, participant_cache, meta["participant"])
 
-        for table_obj in table_objects:
-            for table_name, table_rows in table_obj.items():
-                # Skip metadata fields — only the key whose value is a list
-                # of dicts represents actual table data.
-                if not isinstance(table_rows, list):
-                    continue
+        for record in records:
+            for field_name, raw_value in record.items():
+                # Normalise to NFC so accented field names are stored
+                # consistently regardless of the source JSON encoding.
+                field_name = unicodedata.normalize("NFC", field_name)
+                field_id = _get_or_create_field(con, field_cache, source, field_name)
+                value = _to_db_value(raw_value)
 
-                for row in table_rows:
-                    if not isinstance(row, dict):
-                        continue
+                data_batch.append(
+                    (
+                        field_id,
+                        participant_id,
+                        meta.get("assignment"),
+                        meta.get("task"),
+                        meta.get("key"),
+                        value,
+                    )
+                )
 
-                    for col_name, raw_value in row.items():
-                        field_name = f"{table_name}.{col_name}"
-                        field_id = _get_or_create_field(con, field_cache, source, field_name)
-                        value = _to_db_value(raw_value)
-
-                        data_batch.append(
-                            (
-                                field_id,
-                                participant_id,
-                                meta.get("assignment"),
-                                meta.get("task"),
-                                meta.get("key"),
-                                value,
-                            )
-                        )
-
-                        # Auto-queue URL values for scraping.
-                        if value and _is_url(value):
-                            normalized = normalize_url(value)
-                            if normalized:
-                                url_batch.append((participant_id, field_id, value, normalized))
+                # Auto-queue URL values for scraping.
+                if value and _is_url(value):
+                    normalized = normalize_url(value)
+                    if normalized:
+                        url_batch.append((participant_id, field_id, value, normalized))
 
         total_files += 1
-        con.execute("INSERT OR IGNORE INTO ingested_files (file_stem) VALUES (?)", (path.stem,))
 
         if len(data_batch) >= batch_size:
             _flush()
@@ -454,5 +440,4 @@ def ingest_donation_directory(
         "rows": total_rows,
         "urls": total_urls,
         "skipped": skipped,
-        "already_ingested": already_ingested,
     }

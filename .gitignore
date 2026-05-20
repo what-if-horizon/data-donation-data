@@ -11,3 +11,5 @@ build/
 *.log
 
 data/*
+data.db
+data.zip

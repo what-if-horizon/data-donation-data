@@ -11,8 +11,10 @@ ddd sources
 ddd summarise <table>
 ddd summarise-source <source>
 ddd field-summary [--output FILE]
+ddd participant-summary [--output FILE]
 ddd extract <table> <col>... [--output FILE] [--format csv|jsonl] [--where CLAUSE]
-ddd export init [--output FILE]
+ddd remove [--assignment ID] [--task ID] [--participant ID] [--yes]
+ddd create-config [--output FILE]
 ddd scrape run [--limit N] [--delay-min S] [--delay-max S] [--concurrency N]
 ddd scrape status
 """
@@ -38,9 +40,58 @@ from data_donation_data.summarise import (
     participant_field_summary,
     summarise_all_sources,
     summarise_source,
+    task_assignment_summary,
 )
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Alias-map helper
+# ---------------------------------------------------------------------------
+
+
+def _try_load_alias_map() -> dict[str, dict[str, str]]:
+    """
+    Load alias mappings from ``ddd_export.yaml`` if it exists.
+
+    Returns an empty dict (no aliases) when the file is absent or invalid,
+    so callers never have to handle a missing config file specially.
+    """
+    try:
+        from data_donation_data.export import build_alias_map, load_export_yaml
+
+        return build_alias_map(load_export_yaml(DEFAULT_YAML_PATH))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _try_load_export_config() -> dict:
+    """
+    Load the full export config from ``ddd_export.yaml`` if it exists.
+
+    Returns ``{"tasks": {}, "assignments": {}, "sources": {}}`` when the
+    file is absent or invalid.
+    """
+    try:
+        from data_donation_data.export import load_export_yaml
+
+        return load_export_yaml(DEFAULT_YAML_PATH)
+    except (FileNotFoundError, ValueError):
+        return {"tasks": {}, "assignments": {}, "sources": {}}
+
+
+def _try_load_exclusion_set() -> dict[str, frozenset[str]]:
+    """
+    Load per-source exclusion sets from ``ddd_export.yaml`` if it exists.
+    Returns an empty dict when the file is absent or invalid.
+    """
+    try:
+        from data_donation_data.export import build_exclusion_set, load_export_yaml
+
+        return build_exclusion_set(load_export_yaml(DEFAULT_YAML_PATH))
+    except (FileNotFoundError, ValueError):
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +183,12 @@ def cmd_ingest(directory: Path, recursive: bool) -> None:
 
     skipped_note = f" ([dim]{counts['skipped']} file(s) skipped[/dim])" if counts["skipped"] else ""
     url_note = f", [bold]{counts['urls']:,}[/bold] URL(s) queued" if counts["urls"] else ""
-    already_note = f" ([dim]{counts['already_ingested']:,} already ingested[/dim])" if counts["already_ingested"] else ""
     console.print(
         f"[green]✓[/green] Ingested "
         f"[bold]{counts['files']}[/bold] file(s) / "
         f"[bold]{counts['rows']:,}[/bold] row(s)"
         f"{url_note}"
         f"{skipped_note}"
-        f"{already_note}"
     )
 
 
@@ -189,15 +238,24 @@ def cmd_summarise() -> None:
 
 @cli.command("summarise-source")
 @click.argument("source")
-def cmd_summarise_source(source: str) -> None:
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include excluded fields (ignore .excluded in config).")
+@click.option("--no-alias", "no_alias", is_flag=True, default=False, help="Use original field names (ignore alias mappings).")
+def cmd_summarise_source(source: str, show_all: bool, no_alias: bool) -> None:
     """Print a field-level summary for a donation SOURCE.
 
     SOURCE is a data source name as returned by `ddd sources`
-    (e.g. youtube, google_chrome).
+    (e.g. youtube, google_chrome).  Field aliases defined in
+    ddd_export.yaml are applied automatically when the file exists.
     """
+    alias_map = _try_load_alias_map()
+    exclusion_set = _try_load_exclusion_set()
+    if show_all:
+        exclusion_set = {}
+    if no_alias:
+        alias_map = {}
     with get_connection() as con:
         try:
-            rows = summarise_source(con, source)
+            rows = summarise_source(con, source, alias_map=alias_map, exclusion_set=exclusion_set)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -206,10 +264,12 @@ def cmd_summarise_source(source: str) -> None:
         return
 
     total_rows = sum(r["n_total"] for r in rows)
+    alias_note = " [dim](aliases applied)[/dim]" if alias_map.get(source) else ""
     console.print(
         f"\n[bold]Source:[/bold] [cyan]{source}[/cyan]  "
         f"[bold]Fields:[/bold] {len(rows)}  "
-        f"[bold]Total observations:[/bold] {total_rows:,}\n"
+        f"[bold]Total observations:[/bold] {total_rows:,}"
+        f"{alias_note}\n"
     )
 
     t = RichTable(show_lines=True)
@@ -232,6 +292,69 @@ def cmd_summarise_source(source: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ddd participant-summary
+# ---------------------------------------------------------------------------
+
+
+@cli.command("participant-summary")
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write CSV to this file instead of printing a table.",
+)
+def cmd_participant_summary(output: Path | None) -> None:
+    """Show participant counts per task and assignment.
+
+    Displays the number of distinct participants for every (task, assignment)
+    combination found in the database.  Human-readable task and assignment
+    names are shown when defined in ``ddd_export.yaml``.
+
+    With --output a CSV is written instead of the interactive table.
+    """
+    cfg = _try_load_export_config()
+    task_names: dict[str, str] = cfg.get("tasks", {})
+    assignment_names: dict[str, str] = cfg.get("assignments", {})
+
+    with get_connection() as con:
+        rows = task_assignment_summary(con, task_names=task_names, assignment_names=assignment_names)
+
+    if not rows:
+        console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
+        return
+
+    fieldnames = ["task", "task_name", "assignment", "assignment_name", "n_participants"]
+
+    if output is not None:
+        with output.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        console.print(f"[green]\u2713[/green] Wrote [bold]{len(rows):,}[/bold] rows to [cyan]{output}[/cyan]")
+        return
+
+    # Rich table output
+    tbl = RichTable(show_header=True, header_style="bold cyan")
+    tbl.add_column("Task", style="dim")
+    tbl.add_column("Task name")
+    tbl.add_column("Assignment", style="dim")
+    tbl.add_column("Assignment name")
+    tbl.add_column("Participants", justify="right", style="bold")
+
+    for row in rows:
+        tbl.add_row(
+            row["task"] or "(none)",
+            row["task_name"] or "",
+            row["assignment"] or "(none)",
+            row["assignment_name"] or "",
+            str(row["n_participants"]),
+        )
+
+    console.print(tbl)
+
+
+# ---------------------------------------------------------------------------
 # ddd field-summary
 # ---------------------------------------------------------------------------
 
@@ -244,7 +367,9 @@ def cmd_summarise_source(source: str) -> None:
     default=None,
     help="Write CSV to this file instead of stdout.",
 )
-def cmd_field_summary(output: Path | None) -> None:
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include excluded fields (ignore .excluded in config).")
+@click.option("--no-alias", "no_alias", is_flag=True, default=False, help="Use original field names (ignore alias mappings).")
+def cmd_field_summary(output: Path | None, show_all: bool, no_alias: bool) -> None:
     """Export a long-format participant × field summary as CSV.
 
     For every combination of (source, participant, field) the CSV reports:
@@ -252,12 +377,18 @@ def cmd_field_summary(output: Path | None) -> None:
     \b
       source       — data source name
       participant  — participant identifier
-      field        — field name
+      field        — field name (canonical; aliases applied if ddd_export.yaml exists)
       n_non_null   — number of non-missing values
       n_total      — total rows for this participant in this source
     """
+    alias_map = _try_load_alias_map()
+    exclusion_set = _try_load_exclusion_set()
+    if show_all:
+        exclusion_set = {}
+    if no_alias:
+        alias_map = {}
     with get_connection() as con:
-        rows = participant_field_summary(con)
+        rows = participant_field_summary(con, alias_map=alias_map, exclusion_set=exclusion_set)
 
     if not rows:
         console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
@@ -328,16 +459,166 @@ def cmd_extract(
 
 
 # ---------------------------------------------------------------------------
-# ddd export
+# ddd remove
 # ---------------------------------------------------------------------------
 
 
-@cli.group("export")
-def export_group() -> None:
-    """Commands for configuring and running data exports."""
+@cli.command("remove")
+@click.option("--assignment", "-a", default=None, help="Remove data with this assignment ID.")
+@click.option("--task", "-t", default=None, help="Remove data with this task ID.")
+@click.option("--participant", "-p", default=None, help="Remove data for this participant.")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+def cmd_remove(
+    assignment: str | None,
+    task: str | None,
+    participant: str | None,
+    yes: bool,
+) -> None:
+    """Remove ingested data by assignment, task, and/or participant.
+
+    At least one filter must be supplied.  Filters are combined with AND,
+    so only rows matching ALL supplied values are removed.
+
+    \b
+    Examples:
+      ddd remove --assignment 1
+      ddd remove --task 10
+      ddd remove --assignment 1 --task 10
+      ddd remove --participant abc123
+
+    After deletion, orphaned participants, their queued URLs, and any
+    fields with no remaining data are automatically cleaned up.
+    Ingested-file records matching the filters are also removed so the
+    files can be re-ingested if needed.
+    """
+    if not any([assignment, task, participant]):
+        raise click.ClickException("Provide at least one of --assignment, --task, --participant.")
+
+    # Build a parameterised WHERE clause that works with the data+participants join.
+    conditions: list[str] = []
+    params: list[str] = []
+    if assignment is not None:
+        conditions.append("d.assignment = ?")
+        params.append(assignment)
+    if task is not None:
+        conditions.append("d.task = ?")
+        params.append(task)
+    if participant is not None:
+        conditions.append("p.participant = ?")
+        params.append(participant)
+
+    where = " AND ".join(conditions)
+    join = "FROM data d JOIN participants p ON d.participant_id = p.participant_id"
+
+    with get_connection() as con:
+        n_rows = con.execute(f"SELECT COUNT(*) {join} WHERE {where}", params).fetchone()[0]
+
+        if n_rows == 0:
+            console.print("[yellow]No matching data found.[/yellow]")
+            return
+
+        # Gather preview details.
+        affected = con.execute(
+            f"""
+            SELECT d.assignment, d.task, p.participant,
+                   COUNT(*) AS n_rows
+            {join}
+            WHERE {where}
+            GROUP BY d.assignment, d.task, p.participant
+            ORDER BY d.assignment, d.task, p.participant
+            """,
+            params,
+        ).fetchall()
+
+        tbl = RichTable(show_header=True, header_style="bold yellow")
+        tbl.add_column("Assignment")
+        tbl.add_column("Task")
+        tbl.add_column("Participant")
+        tbl.add_column("Rows", justify="right")
+        for row in affected:
+            tbl.add_row(
+                row["assignment"] or "(none)",
+                row["task"] or "(none)",
+                row["participant"] or "(none)",
+                f"{row['n_rows']:,}",
+            )
+        console.print(tbl)
+        console.print(
+            f"[bold yellow]This will permanently delete "
+            f"{n_rows:,} row(s) across "
+            f"{len({r['participant'] for r in affected})} participant(s).[/bold yellow]"
+        )
+
+        if not yes:
+            click.confirm("Continue?", abort=True)
+
+        # Remember which participants are affected before deleting.
+        affected_pids: list[int] = [
+            r[0] for r in con.execute(f"SELECT DISTINCT p.participant_id {join} WHERE {where}", params).fetchall()
+        ]
+
+        # Delete matching data rows.
+        con.execute(
+            f"DELETE FROM data WHERE data_id IN (SELECT d.data_id {join} WHERE {where})",
+            params,
+        )
+
+        # Remove ingested_file records so affected files can be re-ingested.
+        # Each filter becomes a LIKE pattern against the filename stem.
+        file_conditions: list[str] = []
+        file_params: list[str] = []
+        if assignment is not None:
+            # assignment is always the first key in the stem.
+            file_conditions.append("file_stem LIKE ?")
+            file_params.append(f"assignment={assignment}_%")
+        if task is not None:
+            file_conditions.append("file_stem LIKE ?")
+            file_params.append(f"%_task={task}_%")
+        if participant is not None:
+            file_conditions.append("file_stem LIKE ?")
+            file_params.append(f"%_participant={participant}_%")
+        n_files = con.execute(
+            f"DELETE FROM ingested_files WHERE {' AND '.join(file_conditions)}",
+            file_params,
+        ).rowcount
+
+        # Clean up participants that now have no data at all.
+        orphaned_pids: list[int] = []
+        if affected_pids:
+            ph = ",".join("?" * len(affected_pids))
+            orphaned_pids: list[int] = [
+                r[0]
+                for r in con.execute(
+                    f"SELECT participant_id FROM participants "
+                    f"WHERE participant_id IN ({ph}) "
+                    f"AND participant_id NOT IN (SELECT DISTINCT participant_id FROM data)",
+                    affected_pids,
+                ).fetchall()
+            ]
+            if orphaned_pids:
+                oph = ",".join("?" * len(orphaned_pids))
+                con.execute(f"DELETE FROM urls         WHERE participant_id IN ({oph})", orphaned_pids)
+                con.execute(f"DELETE FROM participants WHERE participant_id IN ({oph})", orphaned_pids)
+
+        # Clean up fields that now have no data at all.
+        n_fields = con.execute("DELETE FROM fields WHERE field_id NOT IN (SELECT DISTINCT field_id FROM data)").rowcount
+
+        con.commit()
+
+    parts = [f"[bold]{n_rows:,}[/bold] data row(s)"]
+    if n_files:
+        parts.append(f"[bold]{n_files}[/bold] file record(s)")
+    if orphaned_pids:
+        parts.append(f"[bold]{len(orphaned_pids)}[/bold] orphaned participant(s)")
+    if n_fields:
+        parts.append(f"[bold]{n_fields}[/bold] unused field(s)")
+    console.print("[green]✓[/green] Removed " + ", ".join(parts) + ".")
 
 
-@export_group.command("init")
+# ---------------------------------------------------------------------------
+
+
+@cli.command("create-config")
 @click.option(
     "--output",
     "-o",
@@ -345,15 +626,30 @@ def export_group() -> None:
     default=None,
     help=f"Path for the YAML file. Defaults to {DEFAULT_YAML_PATH}.",
 )
-def cmd_export_init(output: Path | None) -> None:
-    """Create or update ddd_export.yaml with all available fields.
+def cmd_create_config(output: Path | None) -> None:
+    """Create or update the ddd_export.yaml configuration file.
 
-    Every (source, field) combination found in the database is listed with
-    a true/false toggle.  Existing toggles are preserved; newly discovered
-    fields are added with true (included) by default.
+    Writes a YAML file listing every (source, field) found in the database.
+    Open the file in a text editor to customise it — all settings are
+    preserved when you re-run this command after ingesting more data.
 
-    Edit the file manually to toggle fields on or off, then re-run this
-    command after ingesting more data to pick up any new fields.
+    Field settings (one block per source):
+
+    \b
+      include — true/false, whether to include the field in exports
+      aliases — alternative field names treated as this one in summaries
+
+    Optional top-level name mappings (used by `ddd participant-summary`):
+
+    \b
+      tasks:
+        "10": YouTube Watch History
+        "20": Chrome Browsing History
+
+    \b
+      assignments:
+        "1": Pilot Round
+        "2": Main Study
     """
     yaml_path = output or DEFAULT_YAML_PATH
 
