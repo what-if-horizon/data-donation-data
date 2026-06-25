@@ -16,6 +16,7 @@ ddd export [SOURCE...] [--output FILE] [--format csv|jsonl] [--all] [--assignmen
 ddd export-aliases [--output FILE]
 ddd export-summarise [SOURCE...] [--output FILE] [--all] [--no-alias]
 ddd export-examples [SOURCE...] [--output FILE] [--n N] [--random] [--all] [--no-alias]  (one row per example value)
+ddd export-data [SOURCE...] [--output-dir DIR] [--all] [--no-alias]
 ddd remove [--assignment ID] [--task ID] [--participant ID] [--yes]
 ddd create-config [--output FILE]
 ddd scrape run [--limit N] [--delay-min S] [--delay-max S] [--concurrency N]
@@ -713,6 +714,208 @@ def cmd_export_examples(
                     n_written += 1
 
     console.print(f"[green]✓[/green] Wrote [bold]{n_written:,}[/bold] rows to [cyan]{output}[/cyan]")
+
+
+# ---------------------------------------------------------------------------
+# ddd export-data
+# ---------------------------------------------------------------------------
+
+
+@cli.command("export-data")
+@click.argument("sources", nargs=-1)
+@click.option(
+    "--output-dir",
+    "-o",
+    default="ddd_cleaned",
+    show_default=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Root output directory.",
+)
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include excluded fields.")
+@click.option("--no-alias", "no_alias", is_flag=True, default=False, help="Use original field and table names.")
+def cmd_export_data(
+    sources: tuple[str, ...],
+    output_dir: Path,
+    show_all: bool,
+    no_alias: bool,
+) -> None:
+    """Export cleaned data as per-participant wide-format CSV files.
+
+    For every (source, table, participant, assignment) combination, writes one
+    CSV file where each row is an original data row and each column is an
+    aliased field name.
+
+    \b
+    Directory layout:
+      ddd_cleaned/
+        {source}/
+          {table}/
+            {assignment_name}_{participant}.csv
+
+    Tables that share a .alias in ddd_export.yaml are merged into the same
+    folder.  Field and table names use aliases from ddd_export.yaml.
+
+    \b
+    Examples:
+      ddd export-data                   # all sources → ddd_cleaned/
+      ddd export-data facebook youtube  # specific sources
+      ddd export-data -o my_output      # custom output directory
+      ddd export-data --all             # include excluded fields
+    """
+    import re
+    import unicodedata
+    from collections import defaultdict
+
+    from data_donation_data.export import (
+        build_alias_map,
+        build_exclusion_set,
+        build_table_alias_map,
+    )
+
+    config = _try_load_export_config()
+    alias_map = {} if no_alias else build_alias_map(config)
+    exclusion_set = {} if (show_all or no_alias) else build_exclusion_set(config)
+    table_alias_map = {} if no_alias else build_table_alias_map(config)
+    assignment_names: dict[str, str] = config.get("assignments", {})
+
+    def _safe(s: str) -> str:
+        """Sanitise *s* for use as a filename component."""
+        return re.sub(r"[^\w\-]", "_", s).strip("_") or "unknown"
+
+    with get_connection() as con:
+        all_sources_list = list_sources(con)
+
+        if not all_sources_list:
+            console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
+            return
+
+        requested = sorted(sources) if sources else sorted(all_sources_list)
+        unknown = [s for s in requested if s not in all_sources_list]
+        if unknown:
+            raise click.ClickException(f"Unknown source(s): {', '.join(unknown)}. Available: {', '.join(all_sources_list)}")
+
+        n_files = 0
+
+        for source in requested:
+            console.print(f"[bold]{source}[/bold]")
+
+            table_names = [
+                r["table_name"]
+                for r in con.execute(
+                    "SELECT DISTINCT table_name FROM tables WHERE source = ? ORDER BY table_name",
+                    (source,),
+                ).fetchall()
+            ]
+
+            # Group original table names by their canonical alias.
+            # Tables that share an alias are merged into one output directory.
+            alias_to_tables: dict[str, list[str]] = defaultdict(list)
+            for tbl in table_names:
+                alias = table_alias_map.get(source, {}).get(tbl, tbl)
+                alias_to_tables[alias].append(tbl)
+
+            for tbl_alias, original_tables in sorted(alias_to_tables.items()):
+                table_dir = output_dir / source / tbl_alias
+                table_dir.mkdir(parents=True, exist_ok=True)
+
+                phs = ",".join("?" * len(original_tables))
+
+                # Build field_id → canonical column name (exclusions applied).
+                field_rows = con.execute(
+                    f"""
+                    SELECT f.field_id, f.field, t.table_name
+                    FROM fields f
+                    JOIN tables t ON t.table_id = f.table_id
+                    WHERE t.source = ? AND t.table_name IN ({phs})
+                    ORDER BY f.field
+                    """,
+                    [source] + original_tables,
+                ).fetchall()
+
+                field_id_to_col: dict[int, str] = {}
+                columns: list[str] = []
+                seen: set[str] = set()
+
+                for frow in field_rows:
+                    field_nfc = unicodedata.normalize("NFC", frow["field"])
+                    if field_nfc in exclusion_set.get(source, {}).get(frow["table_name"], frozenset()):
+                        continue
+                    col = alias_map.get(source, {}).get(frow["table_name"], {}).get(field_nfc, field_nfc)
+                    field_id_to_col[frow["field_id"]] = col
+                    if col not in seen:
+                        seen.add(col)
+                        columns.append(col)
+
+                if not columns:
+                    continue
+
+                # Stream rows sorted so all rows for one (participant, assignment)
+                # arrive together — lets us pivot and write without holding the
+                # whole table in memory.
+                data_cur = con.execute(
+                    f"""
+                    SELECT
+                        p.participant,
+                        fi.assignment,
+                        fi.file_id,
+                        d.row_index,
+                        d.field_id,
+                        d.value
+                    FROM data d
+                    JOIN files        fi ON fi.file_id      = d.file_id
+                    JOIN fields       f  ON f.field_id       = d.field_id
+                    JOIN tables       t  ON t.table_id       = f.table_id
+                    JOIN participants p  ON p.participant_id = fi.participant_id
+                    WHERE t.source = ? AND t.table_name IN ({phs})
+                    ORDER BY p.participant, fi.assignment, fi.file_id, d.row_index
+                    """,
+                    [source] + original_tables,
+                )
+
+                # Pivot state for the current (participant, assignment) slice.
+                cur_participant: str | None = None
+                cur_assignment: str | None = None
+                # (file_id, row_index) → {col: value}  — one dict per original row
+                cur_rows: dict[tuple[int, int], dict[str, str]] = {}
+
+                def _flush() -> None:
+                    if cur_participant is None or not cur_rows:
+                        return
+                    asgn_str = str(cur_assignment) if cur_assignment is not None else ""
+                    asgn_label = assignment_names.get(asgn_str, asgn_str)
+                    fname = f"{_safe(asgn_label)}_{_safe(cur_participant)}.csv"
+                    with (table_dir / fname).open("w", newline="", encoding="utf-8") as fh:
+                        w = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+                        w.writeheader()
+                        for row_dict in cur_rows.values():
+                            w.writerow(row_dict)
+                    nonlocal n_files
+                    n_files += 1
+
+                for dr in data_cur:
+                    fid: int = dr["field_id"]
+                    if fid not in field_id_to_col:
+                        continue  # excluded field
+
+                    participant: str = dr["participant"]
+                    assignment: str | None = dr["assignment"]
+
+                    if (participant, assignment) != (cur_participant, cur_assignment):
+                        _flush()
+                        cur_participant = participant
+                        cur_assignment = assignment
+                        cur_rows = {}
+
+                    rkey = (int(dr["file_id"]), int(dr["row_index"]))
+                    if rkey not in cur_rows:
+                        cur_rows[rkey] = {}
+                    cur_rows[rkey][field_id_to_col[fid]] = dr["value"]
+
+                _flush()  # write the last participant
+
+            console.print(f"  {source}: done")
+
+    console.print(f"\n[green]✓[/green] Wrote [bold]{n_files:,}[/bold] files to [cyan]{output_dir}/[/cyan]")
 
 
 # ---------------------------------------------------------------------------
