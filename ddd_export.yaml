@@ -26,6 +26,11 @@
 #       .alias: likes_and_reactions   # merge with the table above
 #       timestamp: timestamp
 
+assignments:
+  "359": Spain
+  "426": Netherlands
+  "450": Netherlands
+
 facebook:
   $Username:
     .alias: username

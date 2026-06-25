@@ -14,6 +14,8 @@ ddd field-summary [--output FILE]
 ddd participant-summary [--output FILE]
 ddd export [SOURCE...] [--output FILE] [--format csv|jsonl] [--all] [--assignment ID] [--task ID]
 ddd export-aliases [--output FILE]
+ddd export-summarise [SOURCE...] [--output FILE] [--all] [--no-alias]
+ddd export-examples [SOURCE...] [--output FILE] [--n N] [--random] [--all] [--no-alias]  (one row per example value)
 ddd remove [--assignment ID] [--task ID] [--participant ID] [--yes]
 ddd create-config [--output FILE]
 ddd scrape run [--limit N] [--delay-min S] [--delay-max S] [--concurrency N]
@@ -299,6 +301,418 @@ def cmd_summarise_source(source: str, show_all: bool, no_alias: bool) -> None:
             t.add_row(f["field"], f"{f['n_participants']:,}", f"{f['n_rows']:,}")
         console.print(t)
         console.print()
+
+
+# ---------------------------------------------------------------------------
+# ddd export-summarise
+# ---------------------------------------------------------------------------
+
+
+@cli.command("export-summarise")
+@click.argument("sources", nargs=-1)
+@click.option(
+    "--output",
+    "-o",
+    default="ddd_summary.csv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="Output CSV file.",
+)
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include excluded fields.")
+@click.option("--no-alias", "no_alias", is_flag=True, default=False, help="Use original field and table names.")
+@click.option(
+    "--by-participant",
+    is_flag=True,
+    default=False,
+    help="Add a participant column (one row per field × assignment × participant).",
+)
+def cmd_export_summarise(
+    sources: tuple[str, ...],
+    output: Path,
+    show_all: bool,
+    no_alias: bool,
+    by_participant: bool,
+) -> None:
+    """Export a field-level summary for all sources to a single CSV.
+
+    By default writes one row per (original_field × assignment) with
+    both raw DB names and canonical aliases, so analysts can group and
+    aggregate freely.
+
+    With --by-participant, breaks down to one row per
+    (original_field × assignment × participant); n_participants is
+    replaced by a participant column.
+
+    \b
+    Default columns:
+      source          — data source (facebook, youtube, …)
+      original_table  — raw table name as stored in the DB
+      table           — canonical alias (from .alias in ddd_export.yaml)
+      original_field  — raw field name as stored in the DB
+      field           — canonical alias (from ddd_export.yaml)
+      assignment      — assignment ID
+      assignment_name — human-readable name (from ddd_export.yaml)
+      n_participants  — distinct participants with this field in this assignment
+      n_rows          — total stored cell values
+
+    \b
+    Examples:
+      ddd export-summarise                        # all sources → ddd_summary.csv
+      ddd export-summarise facebook youtube       # specific sources
+      ddd export-summarise -o my_summary.csv
+      ddd export-summarise --by-participant       # one row per participant
+      ddd export-summarise --no-alias             # raw names only
+    """
+    import unicodedata
+
+    from data_donation_data.export import (
+        build_alias_map,
+        build_exclusion_set,
+        build_table_alias_map,
+    )
+
+    config = _try_load_export_config()
+    alias_map = {} if no_alias else build_alias_map(config)
+    exclusion_set = {} if (show_all or no_alias) else build_exclusion_set(config)
+    table_alias_map = {} if no_alias else build_table_alias_map(config)
+    assignment_names: dict[str, str] = config.get("assignments", {})
+
+    with get_connection() as con:
+        all_sources = list_sources(con)
+
+    if not all_sources:
+        console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
+        return
+
+    requested = sorted(sources) if sources else sorted(all_sources)
+
+    unknown = [s for s in requested if s not in all_sources]
+    if unknown:
+        raise click.ClickException(f"Unknown source(s): {', '.join(unknown)}. Available: {', '.join(all_sources)}")
+
+    placeholders = ",".join("?" * len(requested))
+
+    if by_participant:
+        sql = f"""
+            WITH per_file AS (
+                SELECT d.field_id, d.file_id, COUNT(*) AS n_rows
+                FROM data d
+                GROUP BY d.field_id, d.file_id
+            )
+            SELECT
+                t.source,
+                t.table_name,
+                f.field,
+                fi.assignment,
+                p.participant,
+                SUM(pf.n_rows) AS n_rows
+            FROM per_file pf
+            JOIN fields       f  ON f.field_id       = pf.field_id
+            JOIN tables       t  ON t.table_id       = f.table_id
+            JOIN files        fi ON fi.file_id       = pf.file_id
+            JOIN participants p  ON p.participant_id = fi.participant_id
+            WHERE t.source IN ({placeholders})
+            GROUP BY f.field_id, fi.assignment, fi.participant_id
+            ORDER BY t.source, t.table_name, f.field, fi.assignment, p.participant
+        """
+        columns = [
+            "source",
+            "original_table",
+            "table",
+            "original_field",
+            "field",
+            "assignment",
+            "assignment_name",
+            "participant",
+            "n_rows",
+        ]
+    else:
+        sql = f"""
+            WITH per_file AS (
+                SELECT d.field_id, d.file_id, COUNT(*) AS n_rows
+                FROM data d
+                GROUP BY d.field_id, d.file_id
+            )
+            SELECT
+                t.source,
+                t.table_name,
+                f.field,
+                fi.assignment,
+                COUNT(DISTINCT fi.participant_id) AS n_participants,
+                SUM(pf.n_rows)                   AS n_rows
+            FROM per_file pf
+            JOIN fields f  ON f.field_id  = pf.field_id
+            JOIN tables t  ON t.table_id  = f.table_id
+            JOIN files  fi ON fi.file_id  = pf.file_id
+            WHERE t.source IN ({placeholders})
+            GROUP BY f.field_id, fi.assignment
+            ORDER BY t.source, t.table_name, f.field, fi.assignment
+        """
+        columns = [
+            "source",
+            "original_table",
+            "table",
+            "original_field",
+            "field",
+            "assignment",
+            "assignment_name",
+            "n_participants",
+            "n_rows",
+        ]
+
+    with get_connection() as con:
+        db_rows = con.execute(sql, requested).fetchall()
+
+    n_written = 0
+    with output.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=columns)
+        writer.writeheader()
+        for row in db_rows:
+            src: str = row["source"]
+            tbl: str = row["table_name"]
+            field: str = row["field"]
+            field_nfc = unicodedata.normalize("NFC", field)
+            assignment: str = row["assignment"] or ""
+
+            # Exclusion filter uses original table name (YAML is keyed that way).
+            if field_nfc in exclusion_set.get(src, {}).get(tbl, frozenset()):
+                continue
+
+            canonical_table = table_alias_map.get(src, {}).get(tbl, tbl)
+            canonical_field = alias_map.get(src, {}).get(tbl, {}).get(field_nfc, field_nfc)
+
+            out: dict = {
+                "source": src,
+                "original_table": tbl,
+                "table": canonical_table,
+                "original_field": field,
+                "field": canonical_field,
+                "assignment": assignment,
+                "assignment_name": assignment_names.get(assignment, ""),
+                "n_rows": row["n_rows"],
+            }
+            if by_participant:
+                out["participant"] = row["participant"]
+            else:
+                out["n_participants"] = row["n_participants"]
+
+            writer.writerow(out)
+            n_written += 1
+
+    console.print(f"[green]✓[/green] Wrote [bold]{n_written:,}[/bold] rows to [cyan]{output}[/cyan]")
+    assignments_seen = sorted({row["assignment"] or "" for row in db_rows})
+    console.print("   Assignments: " + ", ".join(f"{a} ({assignment_names.get(a, '?')})" for a in assignments_seen))
+
+
+# ---------------------------------------------------------------------------
+# ddd export-examples
+# ---------------------------------------------------------------------------
+
+
+@cli.command("export-examples")
+@click.argument("sources", nargs=-1)
+@click.option(
+    "--output",
+    "-o",
+    default="ddd_examples.csv",
+    show_default=True,
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    help="Output CSV file.",
+)
+@click.option(
+    "--n",
+    "n_examples",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Number of example values to sample per field.",
+)
+@click.option("--all", "show_all", is_flag=True, default=False, help="Include excluded fields.")
+@click.option("--no-alias", "no_alias", is_flag=True, default=False, help="Use original field and table names.")
+@click.option(
+    "--random",
+    "use_random",
+    is_flag=True,
+    default=False,
+    help="Sample values randomly using ORDER BY RANDOM() (slower; default: first N distinct values).",
+)
+@click.option(
+    "--with-assignment",
+    "with_assignment",
+    is_flag=True,
+    default=False,
+    help="Add assignment and assignment_name columns to the output.",
+)
+def cmd_export_examples(
+    sources: tuple[str, ...],
+    output: Path,
+    n_examples: int,
+    show_all: bool,
+    no_alias: bool,
+    use_random: bool,
+    with_assignment: bool,
+) -> None:
+    """Export a sample of field values to a CSV for quick inspection.
+
+    Writes one row per example value (long format), so each sampled value
+    gets its own row. Aliases are applied; original names are omitted.
+
+    By default, the first N distinct values are used (fast, index-only).
+    Use --random for a random sample; this may be significantly slower on
+    large fields.
+
+    \b
+    Columns (default):
+      source  — data source (facebook, youtube, …)
+      table   — canonical table alias (from .alias in ddd_export.yaml)
+      field   — canonical field alias (from ddd_export.yaml)
+      example — a single sampled value
+
+    \b
+    Additional columns with --with-assignment:
+      assignment      — assignment ID
+      assignment_name — human-readable name (from ddd_export.yaml)
+
+    \b
+    Examples:
+      ddd export-examples                        # all sources → ddd_examples.csv
+      ddd export-examples facebook youtube       # specific sources
+      ddd export-examples -o my_examples.csv
+      ddd export-examples --n 10                 # 10 examples per field
+      ddd export-examples --random               # truly random (slower)
+      ddd export-examples --no-alias             # raw names only
+      ddd export-examples --with-assignment      # include assignment columns
+    """
+    import unicodedata
+
+    from data_donation_data.export import (
+        build_alias_map,
+        build_exclusion_set,
+        build_table_alias_map,
+    )
+
+    config = _try_load_export_config()
+    alias_map = {} if no_alias else build_alias_map(config)
+    exclusion_set = {} if (show_all or no_alias) else build_exclusion_set(config)
+    table_alias_map = {} if no_alias else build_table_alias_map(config)
+
+    if use_random:
+        console.print("[yellow]⚠[/yellow]  --random mode: sampling with ORDER BY RANDOM() — may be slow on large fields.")
+
+    with get_connection() as con:
+        all_sources_list = list_sources(con)
+
+        if not all_sources_list:
+            console.print("[yellow]No data found. Run `ddd ingest` first.[/yellow]")
+            return
+
+        requested = sorted(sources) if sources else sorted(all_sources_list)
+        unknown = [s for s in requested if s not in all_sources_list]
+        if unknown:
+            raise click.ClickException(f"Unknown source(s): {', '.join(unknown)}. Available: {', '.join(all_sources_list)}")
+
+        placeholders = ",".join("?" * len(requested))
+        meta_rows = con.execute(
+            f"""
+            SELECT f.field_id, f.field, t.table_name, t.source
+            FROM fields f
+            JOIN tables t ON t.table_id = f.table_id
+            WHERE t.source IN ({placeholders})
+            ORDER BY t.source, t.table_name, f.field
+            """,
+            requested,
+        ).fetchall()
+
+        assignment_names: dict[str, str] = config.get("assignments", {})
+
+        if with_assignment:
+            # Collect distinct assignments for a field, then sample N rows per
+            # assignment separately.  A single LIMIT over the full data table
+            # would be biased toward whichever assignment has lower file_ids
+            # (i.e. was ingested first).
+            assignments_sql = """
+                SELECT DISTINCT fi.assignment
+                FROM data d
+                JOIN files fi ON fi.file_id = d.file_id
+                WHERE d.field_id = ?
+            """
+            if use_random:
+                sample_sql = """
+                    SELECT d.value, fi.assignment
+                    FROM data d
+                    JOIN files fi ON fi.file_id = d.file_id
+                    WHERE d.field_id = ? AND fi.assignment = ? AND d.value IS NOT NULL
+                    ORDER BY RANDOM()
+                    LIMIT ?
+                """
+            else:
+                sample_sql = """
+                    SELECT d.value, fi.assignment
+                    FROM data d
+                    JOIN files fi ON fi.file_id = d.file_id
+                    WHERE d.field_id = ? AND fi.assignment = ? AND d.value IS NOT NULL
+                    LIMIT ?
+                """
+        elif use_random:
+            sample_sql = """
+                SELECT value FROM data
+                WHERE field_id = ? AND value IS NOT NULL
+                ORDER BY RANDOM()
+                LIMIT ?
+            """
+        else:
+            sample_sql = """
+                SELECT DISTINCT value FROM data
+                WHERE field_id = ? AND value IS NOT NULL
+                LIMIT ?
+            """
+
+        columns = ["source", "table", "field"]
+        if with_assignment:
+            columns += ["assignment", "assignment_name"]
+        columns += ["example"]
+        n_written = 0
+
+        with output.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=columns)
+            writer.writeheader()
+
+            for row in meta_rows:
+                src: str = row["source"]
+                tbl: str = row["table_name"]
+                field: str = row["field"]
+                field_nfc = unicodedata.normalize("NFC", field)
+                field_id: int = row["field_id"]
+
+                # Exclusion filter (keyed by original table name, as in YAML).
+                if field_nfc in exclusion_set.get(src, {}).get(tbl, frozenset()):
+                    continue
+
+                canonical_table = table_alias_map.get(src, {}).get(tbl, tbl)
+                canonical_field = alias_map.get(src, {}).get(tbl, {}).get(field_nfc, field_nfc)
+
+                sample_rows: list = []
+                if with_assignment:
+                    field_assignments = [r["assignment"] for r in con.execute(assignments_sql, (field_id,)).fetchall()]
+                    for asgn in field_assignments:
+                        sample_rows.extend(con.execute(sample_sql, (field_id, asgn, n_examples)).fetchall())
+                else:
+                    sample_rows = con.execute(sample_sql, (field_id, n_examples)).fetchall()
+                for sample in sample_rows:
+                    out: dict = {
+                        "source": src,
+                        "table": canonical_table,
+                        "field": canonical_field,
+                    }
+                    if with_assignment:
+                        assignment = sample["assignment"] or ""
+                        out["assignment"] = assignment
+                        out["assignment_name"] = assignment_names.get(assignment, "")
+                    out["example"] = sample["value"]
+                    writer.writerow(out)
+                    n_written += 1
+
+    console.print(f"[green]✓[/green] Wrote [bold]{n_written:,}[/bold] rows to [cyan]{output}[/cyan]")
 
 
 # ---------------------------------------------------------------------------
